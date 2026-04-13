@@ -225,16 +225,12 @@ function formatProductsForPrompt(products) {
   ).join("\n");
 }
 
-function strikethrough(text) {
-  return text.split('').join('\u0336') + '\u0336';
-}
-
 function calcPromo(regularPrice, price) {
   const regular = parseFloat(regularPrice) || 0;
   const offer = parseFloat(price) || 0;
   const hasDiscount = regular > 0 && offer > 0 && regular > offer;
   if (!hasDiscount) return null;
-  return `${strikethrough(formatCLP(regular))} ${formatCLP(offer)} ⚡ ¡Oferta!`;
+  return `${formatCLP(regular)} → ${formatCLP(offer)} ⚡ ¡Oferta!`;
 }
 
 async function askClaude(conversationId, userMessage) {
@@ -658,7 +654,7 @@ INSTRUCCIONES ESTRICTAS:
 - El campo MESSAGE debe ser siempre una frase natural y amigable, nunca una copia del texto del cliente
 - Para SPECS extrae SOLO estos datos del campo Descripcion: procesador | RAM | GPU | almacenamiento | tamaño pantalla. IGNORA todo lo demas como Sistema Operativo, cache, etc. NUNCA uses comillas dobles. Ejemplo: Ryzen 5 7535HS | 16GB DDR5 | RTX 3050 | 512GB SSD | 15pulg — maximo 90 caracteres
 - Los precios son en pesos chilenos CLP con formato $1.299.000
-- Para PROMO: si PROMO_CALCULADO no es none, usalo como base pero agregale al final un tagline corto de maximo 20 caracteres con emoji segun el tipo de laptop. Si es none escribe el precio oferta en formato CLP seguido de punto medio y emoji y una frase corta de maximo 40 caracteres con beneficio claro.
+- Para PROMO: si PROMO_CALCULADO no es none, usalo como base pero agregale al final un tagline corto de maximo 20 caracteres con emoji segun el tipo de laptop. Ejemplos: $4.899.990 → $3.599.990 ⚡ ¡Oferta! · 🔥 Top gaming o $1.219.990 → $879.990 ⚡ ¡Oferta! · ✨ Ideal uni. Si es none escribe el precio oferta en formato CLP seguido de punto medio y emoji y una frase corta de maximo 40 caracteres con beneficio claro. Ejemplos: $1.299.000 · ✨ Ideal para diseño versatil o $899.990 · 🎯 Perfecta para la universidad
 - IMPORTANTE: Los valores de todos los campos de texto NO deben contener comillas dobles internas.
 - Devuelve SOLO un JSON valido sin texto adicional sin markdown:
 {"message":"texto del mensaje general","items":[{"TITLE":"nombre completo","TITLE_DISPLAY":"nombre corto max 40 chars","PRECIO_REGULAR_FORMAT":"$1.299.000","PRECIO_OFERTA_FORMAT":"$1.099.000","PRECIO_REGULAR":1299000,"PRECIO_OFERTA":1099000,"URL":"url exacta del producto","IMAGEN":"url exacta de la imagen","SPECS":"procesador RAM GPU almacenamiento maximo 90 caracteres","PROMO":"descuento o tagline maximo 50 caracteres"}]}`,

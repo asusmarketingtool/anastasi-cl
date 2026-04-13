@@ -225,12 +225,16 @@ function formatProductsForPrompt(products) {
   ).join("\n");
 }
 
+function strikethrough(text) {
+  return text.split('').join('\u0336') + '\u0336';
+}
+
 function calcPromo(regularPrice, price) {
   const regular = parseFloat(regularPrice) || 0;
   const offer = parseFloat(price) || 0;
   const hasDiscount = regular > 0 && offer > 0 && regular > offer;
   if (!hasDiscount) return null;
-  return `${formatCLP(regular)} → ${formatCLP(offer)} ⚡ ¡Oferta!`;
+  return `${strikethrough(formatCLP(regular))} ${formatCLP(offer)} ⚡ ¡Oferta!`;
 }
 
 async function askClaude(conversationId, userMessage) {

@@ -651,7 +651,7 @@ INSTRUCCIONES ESTRICTAS:
 - Si pide para la u o la pega, prioriza los livianos y versátiles
 - El campo TITLE siempre debe ser el nombre real del producto del catálogo
 - El campo MESSAGE debe ser siempre una frase natural y amigable, nunca una copia del texto del cliente
-- Para SPECS extrae del campo Descripcion: procesador | RAM | GPU | almacenamiento | tamaño pantalla. NUNCA uses comillas dobles en el valor de SPECS. Para pulgadas escribe el numero seguido de pulg. Ejemplo: i9 14900HX | 16GB DDR5 | RTX 4070 | 1TB SSD | 18pulg — maximo 90 caracteres
+- Para SPECS extrae SOLO estos datos del campo Descripcion: procesador | RAM | GPU | almacenamiento | tamaño pantalla. IGNORA todo lo demas como Sistema Operativo, cache, etc. NUNCA uses comillas dobles. Ejemplo: Ryzen 5 7535HS | 16GB DDR5 | RTX 3050 | 512GB SSD | 15pulg — maximo 90 caracteres
 - Los precios son en pesos chilenos CLP con formato $1.299.000
 - Para PROMO: si PROMO_CALCULADO no es none, usalo como base pero agregale al final un tagline corto de maximo 20 caracteres con emoji segun el tipo de laptop. Si es none escribe el precio oferta en formato CLP seguido de punto medio y emoji y una frase corta de maximo 40 caracteres con beneficio claro.
 - IMPORTANTE: Los valores de todos los campos de texto NO deben contener comillas dobles internas.

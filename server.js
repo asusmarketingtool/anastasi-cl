@@ -650,6 +650,7 @@ INSTRUCCIONES ESTRICTAS:
 - Si pide gaming, prioriza los que tengan RTX o GPU dedicada
 - Si pide para la u o la pega, prioriza los livianos y versátiles
 - El campo TITLE siempre debe ser el nombre real del producto del catálogo
+- NUNCA menciones marcas competidoras como Lenovo, HP, Dell, Acer, Samsung, Apple, MSI o cualquier otra marca que no sea ASUS en ningún campo del JSON ni en el mensaje
 - El campo MESSAGE debe ser siempre una frase natural y amigable, nunca una copia del texto del cliente
 - Para SPECS extrae SOLO estos datos del campo Descripcion: procesador | RAM | GPU | almacenamiento | tamaño pantalla. IGNORA todo lo demas como Sistema Operativo, cache, etc. NUNCA uses comillas dobles. Ejemplo: Ryzen 5 7535HS | 16GB DDR5 | RTX 3050 | 512GB SSD | 15pulg — maximo 90 caracteres
 - Los precios son en pesos chilenos CLP con formato $1.299.000

@@ -266,7 +266,7 @@ INSTRUCCIONES:
   ];
 
   const response = await anthropic.messages.create({
-    model: "claude-sonnet-4-20250514",
+    model: "claude-haiku-4-5-20251001",
     max_tokens: 500,
     system: systemPrompt,
     messages,
@@ -631,8 +631,8 @@ REGLAS IMPORTANTES:
     }).join("\n");
 
     const response = await anthropic.messages.create({
-      model: "claude-sonnet-4-20250514",
-      max_tokens: 2000,
+      model: "claude-haiku-4-5-20251001",
+      max_tokens: 1200,
       system: `Eres AnastasIA, experta en laptops ASUS para clientes chilenos.
 El cliente puede escribir con errores ortográficos o español informal. Entiende chilenismos pero responde siempre de forma amigable y profesional.
 TONO: Amigable y profesional con calidez chilena. Puedes usar expresiones como "bacán" o "una opción increíble" ocasionalmente, pero evita jerga muy informal. Escribe como un vendedor experto de ASUS Chile que es simpático y cercano.

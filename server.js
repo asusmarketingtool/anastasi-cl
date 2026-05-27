@@ -335,6 +335,7 @@ app.get("/catalog/search", (req, res) => {
 });
 
 app.get("/anastasia", async (req, res) => {
+  const tStart = Date.now();
   const query = req.query.q || req.query.query || req.query.busqueda || "";
   const ip = req.headers["x-forwarded-for"] || req.socket.remoteAddress || "unknown";
   console.log(`🤖 AnastasIA CL consulta: "${query}"`);
@@ -691,9 +692,10 @@ REGLAS IMPORTANTES:
       return `${i+1}. ${p.title} | Precio oferta: ${p.price} | Precio regular: ${p.regularPrice} | Modelo: ${p.model} | URL: ${addUTM(p.link, sku)} | Imagen: ${p.image} | Descripcion: ${safeDesc} | ${promoHint}`;
     }).join("\n");
 
+    const tClaude = Date.now();
     const response = await anthropic.messages.create({
       model: "claude-haiku-4-5-20251001",
-      max_tokens: 2500,
+      max_tokens: 1500,
       system: `Eres AnastasIA, experta en laptops ASUS para clientes chilenos.
 El cliente puede escribir con errores ortográficos o español informal. Entiende chilenismos pero responde siempre de forma amigable y profesional.
 TONO: Amigable y profesional con calidez chilena. Puedes usar expresiones como "bacán" o "una opción increíble" ocasionalmente, pero evita jerga muy informal. Escribe como un vendedor experto de ASUS Chile que es simpático y cercano.
@@ -728,6 +730,7 @@ INSTRUCCIONES ESTRICTAS:
 {"message":"texto del mensaje general","items":[{"TITLE":"nombre completo","TITLE_DISPLAY":"nombre corto max 40 chars","PRECIO_REGULAR_FORMAT":"$1.299.000","PRECIO_OFERTA_FORMAT":"$1.099.000","PRECIO_REGULAR":1299000,"PRECIO_OFERTA":1099000,"URL":"url exacta del producto","IMAGEN":"url exacta de la imagen","SPECS":"procesador RAM GPU almacenamiento maximo 90 caracteres","PROMO":"descuento o tagline maximo 50 caracteres"}]}`,
       messages: [{ role: "user", content: userMessage }],
     });
+    console.log(`⏱️ Claude API: ${Date.now() - tClaude}ms`);
 
     // ── Parse JSON con repair fallback ────────────────────────────────
     const raw = response.content[0].text.trim().replace(/```json|```/g, "").trim();
@@ -749,7 +752,7 @@ INSTRUCCIONES ESTRICTAS:
         throw parseErr;
       }
     }
-    console.log(`✅ AnastasIA CL devuelve ${result.items?.length || 0} productos`);
+    console.log(`✅ AnastasIA CL devuelve ${result.items?.length || 0} productos · Total: ${Date.now() - tStart}ms`);
     return res.json(result);
 
   } catch (err) {

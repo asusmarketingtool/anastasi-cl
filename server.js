@@ -6,6 +6,15 @@ import Anthropic from "@anthropic-ai/sdk";
 const app = express();
 app.use(express.json());
 
+// ── CORS ─────────────────────────────────────────────────────────────
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'GET, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type');
+  if (req.method === 'OPTIONS') return res.sendStatus(200);
+  next();
+});
+
 const CONFIG = {
   FEED_URL: "https://feeds.datafeedwatch.com/73476/10b5e18e7bfbea3baa809971f3bffb5f4ea71dac.xml",
   FEED_REFRESH_MS: 60 * 60 * 1000,
@@ -15,7 +24,7 @@ const CONFIG = {
   PORT: process.env.PORT || 3000,
   MAX_PRODUCTS_IN_PROMPT: 8,
   CONVERSATION_HISTORY: 6,
-  RATE_LIMIT_MAX: 10,
+  RATE_LIMIT_MAX: 40,
   RATE_LIMIT_WINDOW_MS: 60 * 60 * 1000,
   MAX_QUERY_LENGTH: 300,
 };
@@ -24,46 +33,104 @@ let catalog = [];
 const conversations = {};
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
-// ── Rate limiter store ───────────────────────────────────────────────
-const rateLimitStore = {};
+// ── Memoria por sesion para Magento (GET /anastasia) ─────────────────
+// Igual que el objeto `conversations` de Freshchat, pero para la pagina
+// web. Vive en RAM (sin base de datos). Guarda los ultimos turnos y los
+// productos mostrados, para que AnastasIA entienda "mas barata que esas",
+// reconozca cuando el cliente elige un modelo, y no re-recomiende.
+const magentoSessions = {};
+const MAGENTO_HISTORY_TURNS = 6;          // cuantos turnos recordar
+const MAGENTO_SESSION_TTL_MS = 60 * 60 * 1000; // 1h sin actividad -> se borra
 
+function getSession(id) {
+  if (!id) return null;
+  const now = Date.now();
+  let s = magentoSessions[id];
+  if (!s || (now - s.lastSeen) > MAGENTO_SESSION_TTL_MS) {
+    // profile: perfil acumulado de la charla — usos que ha pedido el cliente
+    // (gaming, universidad, etc.) y su presupuesto. Persiste hasta que cambie.
+    s = { history: [], shownProducts: [], profile: { uses: [], budget: null }, lastSeen: now };
+    magentoSessions[id] = s;
+  }
+  if (!s.profile) s.profile = { uses: [], budget: null };
+  s.lastSeen = now;
+  return s;
+}
+
+// Mapa de uso -> palabras que lo activan. Detecta lo que el cliente menciona.
+const USE_PATTERNS = {
+  gaming:      /(gaming|gamer|jugar|juego|juegos|fortnite|valorant|\blol\b|gta|warzone|cod|videojuego)/i,
+  universidad: /(universidad|\bla u\b|estudiar|estudio|estudiante|carrera|tesis|programar|programacion|programación)/i,
+  trabajo:     /(trabajo|trabajar|oficina|ofimatica|ofimática|curro|pega|negocio|empresa)/i,
+  diseño:      /(diseño|diseno|autocad|render|3d|edicion|edición|edita|photoshop|illustrator|premiere|arquitectura)/i,
+  portatil:    /(liviana|ligera|portatil|portátil|llevar|viaje|delgada|ultraligera)/i,
+};
+
+// Actualiza el perfil de la sesion con lo que dice el cliente en este mensaje.
+// Si pide "solo X" o "ya no gaming", reemplaza/quita. Si suma un uso, lo agrega.
+function updateProfile(session, query) {
+  if (!session) return;
+  const q = query.toLowerCase();
+  const p = session.profile;
+
+  // ¿Pivote explícito? ("solo para trabajo", "ahora para la u", "ya no gaming")
+  const exclusive = /\b(solo|solamente|unicamente|únicamente|nada mas|nada más|nomas|nomás|ahora si|ahora sí|mejor solo|en realidad)\b/i.test(q);
+  const dropGaming = /(ya no.*(gaming|juego|jugar)|no.*(para )?(gaming|juegos|jugar)|sin juegos|nada de juego)/i.test(q);
+
+  // Detectar usos mencionados en este mensaje
+  const mentioned = [];
+  for (const [use, re] of Object.entries(USE_PATTERNS)) {
+    if (re.test(q)) mentioned.push(use);
+  }
+
+  if (dropGaming) p.uses = p.uses.filter(u => u !== "gaming");
+
+  if (mentioned.length) {
+    if (exclusive) {
+      // "solo para X" -> reemplaza el perfil por lo mencionado ahora
+      p.uses = mentioned;
+    } else {
+      // suma los nuevos sin perder los anteriores
+      mentioned.forEach(u => { if (!p.uses.includes(u)) p.uses.push(u); });
+    }
+  }
+
+  // Presupuesto: si menciona uno nuevo, actualiza
+  const b = extractBudget(q);
+  if (b) p.budget = b;
+}
+
+// Limpieza periodica de sesiones viejas (evita que la RAM crezca infinito).
+setInterval(() => {
+  const now = Date.now();
+  for (const id in magentoSessions) {
+    if ((now - magentoSessions[id].lastSeen) > MAGENTO_SESSION_TTL_MS) delete magentoSessions[id];
+  }
+}, 10 * 60 * 1000);
+
+const rateLimitStore = {};
 function isRateLimited(ip) {
   const now = Date.now();
-  if (!rateLimitStore[ip]) {
-    rateLimitStore[ip] = { count: 1, firstRequest: now };
-    return false;
-  }
+  if (!rateLimitStore[ip]) { rateLimitStore[ip] = { count: 1, firstRequest: now }; return false; }
   const record = rateLimitStore[ip];
-  if (now - record.firstRequest > CONFIG.RATE_LIMIT_WINDOW_MS) {
-    rateLimitStore[ip] = { count: 1, firstRequest: now };
-    return false;
-  }
+  if (now - record.firstRequest > CONFIG.RATE_LIMIT_WINDOW_MS) { rateLimitStore[ip] = { count: 1, firstRequest: now }; return false; }
   if (record.count >= CONFIG.RATE_LIMIT_MAX) return true;
   record.count++;
   return false;
 }
 
-// ── Spam detector ────────────────────────────────────────────────────
 const spamStore = {};
-
 function isSpam(ip, query) {
   const key = `${ip}:${query.trim().toLowerCase()}`;
   const now = Date.now();
-  if (!spamStore[key]) {
-    spamStore[key] = { count: 1, firstSeen: now };
-    return false;
-  }
+  if (!spamStore[key]) { spamStore[key] = { count: 1, firstSeen: now }; return false; }
   const record = spamStore[key];
-  if (now - record.firstSeen > 5 * 60 * 1000) {
-    spamStore[key] = { count: 1, firstSeen: now };
-    return false;
-  }
+  if (now - record.firstSeen > 5 * 60 * 1000) { spamStore[key] = { count: 1, firstSeen: now }; return false; }
   if (record.count >= 3) return true;
   record.count++;
   return false;
 }
 
-// ── Off-topic detector ───────────────────────────────────────────────
 const offTopicWords = [
   "política","gobierno","presidente","elecciones","partido","congreso",
   "religion","religión","dios","iglesia",
@@ -77,18 +144,81 @@ const offTopicWords = [
   "chiste","broma","cuento",
   "noticias","periodico","periódico","novedades del mundo",
 ];
-
-function isOffTopic(query) {
-  const q = query.toLowerCase();
-  return offTopicWords.some(w => q.includes(w));
+// Coincidencia por PALABRA COMPLETA (no por fragmento). Evita falsos
+// positivos como "buenas" conteniendo "nas", o "descuento" conteniendo
+// "cuento". Frases con espacios se buscan tal cual.
+function hasWord(text, words) {
+  const q = ` ${text.toLowerCase()} `;
+  return words.some(w => {
+    w = w.toLowerCase();
+    if (w.includes(" ")) return q.includes(w);
+    return new RegExp(`(^|[^a-záéíóúñ0-9])${w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}([^a-záéíóúñ0-9]|$)`, "i").test(q);
+  });
 }
 
-// ── CLP price formatter ──────────────────────────────────────────────
+function isOffTopic(query) {
+  return hasWord(query, offTopicWords);
+}
+
+// ── Follow-up / conversacional (responde sin re-recomendar) ──────────
+// Detecta preguntas de seguimiento (envíos, garantía, pago, "cuál me
+// conviene") que NO son búsquedas de producto. Solo se usa en GET /anastasia
+// (Magento). Freshchat NO pasa por aquí.
+function isFollowUp(q) {
+  const followUpWords = [
+    // envíos / tiempos de entrega
+    "cuanto tarda","cuánto tarda","cuanto demora","cuánto demora","cuanto tiempo",
+    "cuánto tiempo","tiempo de entrega","tiempo de envio","tiempo de envío",
+    "cuando llega","cuándo llega","cuando me llega","dias habiles","días hábiles",
+    "envio a","envío a","envian a","envían a","llega a","domicilio","despacho",
+    // garantía (info general; daños/repuestos ya los atrapa serviceWords antes)
+    "tiene garantia","tiene garantía","cuanta garantia","cuánta garantía",
+    "anos de garantia","años de garantía","cubre la garantia","cubre la garantía",
+    // pago / financiación (info general)
+    "formas de pago","medios de pago","puedo pagar","aceptan","cuotas","financiacion",
+    "financiación","tarjeta de credito","tarjeta de crédito","addi","sistecredito",
+    "como es el checkout","checkout","como compro","cómo compro","como pago","cómo pago",
+    "proceso de compra","como finalizo","cómo finalizo","como hago la compra","carrito",
+    "factura","facturacion","facturación","datacredito","pse","contraentrega","contra entrega",
+    // referencia a lo ya mostrado
+    "cual me conviene","cuál me conviene","cual es mejor","cuál es mejor",
+    "cual recomiendas","cuál recomiendas","de esas","de estas","de las que",
+    "la primera","la segunda","la tercera","esa cual","cual de las",
+    "diferencia entre","comparalas","compáralas","cual elijo","cuál elijo",
+    // "la mejor DE las tres/esas" = comparar entre lo mostrado (no nueva busqueda)
+    "de las tres","de los tres","mejor de las","mejor de los","mejor de esas",
+    "mejor de estas","mejor de esos","la mejor de","el mejor de","dame la mejor",
+    "cual es la mejor","cuál es la mejor","la mas potente de","la más potente de",
+    "recomiendame la","recomiéndame la","elijo","me quedo con","cual elegir","cuál elegir",
+    // preguntas de idoneidad sobre las que ya mostro (referencia con demostrativos)
+    "estas sirven","estas son buenas","estas son aptas","estas funcionan",
+    "estos sirven","estos son buenos","estas siguen","estos siguen",
+    "siguen siendo buenas","siguen siendo buenos","esas sirven","esas son buenas",
+    "estas valen","estas aguantan","estos aguantan","estas corren","estos corren",
+    // reclamo de spec faltante (responder con honestidad, no re-buscar)
+    "pero no tiene","pero ninguna tiene","no tienen","ninguna tiene","ninguno tiene",
+    "no tiene i9","no tiene i7","queria i9","quería i9","esa no tiene","ese no tiene",
+    "pero queria","pero quería","no es lo que pedi","no es lo que pedí",
+    // reclamo de idoneidad (no sirve / no es para X)
+    "no es para gaming","no es para juegos","no sirve para gaming","no sirve para juegos",
+    "no son para gaming","no son gaming","no es gaming","esa no es para","ese no es para",
+    "no sirve para","no sirven para","no es buena para","no son buenas para","no es apta",
+    // preguntas de idoneidad (¿es buena para X? / la que me recomendaste)
+    "es buena para","es buen para","son buenas para","sirve para","sirven para","es apta para",
+    "es para gaming","es buena para gaming","sirve para gaming","aguanta gaming","corre",
+    "me recomendaste","que recomendaste","recomendaste","la que me mostraste","esa que",
+    "es buena la","es buena esa","como es la","que tal la","funciona para",
+    // cortesía / cierre
+    "gracias","muchas gracias","listo","perfecto","de una","vale","entendido",
+    "buenisimo","buenísimo","bacán","bacan","la lleva","filete","caleta",
+  ];
+  return hasWord(q, followUpWords);
+}
+
 function formatCLP(amount) {
   return `$${Math.round(amount).toLocaleString("es-CL")}`;
 }
 
-// ── UTM tracker ──────────────────────────────────────────────────────
 function addUTM(url, partNumber) {
   const base = url.includes("?") ? `${url}&` : `${url}?`;
   return `${base}utm_source=freshchat&utm_medium=chatbot&utm_campaign=anastasia-cl&utm_content=${partNumber}`;
@@ -96,28 +226,16 @@ function addUTM(url, partNumber) {
 
 async function refreshCatalog() {
   try {
-    console.log("🔄 Actualizando catálogo CL...");
+    console.log("Actualizando catálogo CO...");
     const res = await fetch(CONFIG.FEED_URL);
     const xml = await res.text();
-    const parser = new XMLParser({
-      ignoreAttributes: false,
-      attributeNamePrefix: "@_",
-      parseTagValue: true,
-    });
+    const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: "@_", parseTagValue: true });
     const parsed = parser.parse(xml);
     const raw = parsed?.products?.product || parsed?.rss?.channel?.item || parsed?.feed?.entry || [];
     const items = Array.isArray(raw) ? raw : [raw];
-
     catalog = items.map((item) => {
-      const val = (v) => {
-        if (!v) return "";
-        if (typeof v === "string") return v.trim();
-        if (typeof v === "number") return String(v);
-        if (v["#text"]) return String(v["#text"]).trim();
-        return "";
-      };
+      const val = (v) => { if (!v) return ""; if (typeof v === "string") return v.trim(); if (typeof v === "number") return String(v); if (v["#text"]) return String(v["#text"]).trim(); return ""; };
       const stripHtml = (s) => s.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").replace(/&nbsp;/g, " ").replace(/&[a-z]+;/g, "").trim().slice(0, 300);
-
       return {
         id:           val(item.Part_Number) || val(item.Model) || "",
         title:        val(item.Name)        || val(item.title) || "",
@@ -137,22 +255,47 @@ async function refreshCatalog() {
       const regular = parseFloat(p.regularPrice) || 0;
       const offer = parseFloat(p.price) || 0;
       if (regular > 0 && offer > 0 && (offer / regular) < 0.5) return false;
+
+      // ── Filtrar accesorios: el feed trae cases, mochilas, mouse, etc.
+      // que NO son laptops. Sin esto, un case barato se cuela como
+      // "alternativa economica" y rompe la recomendacion.
+      const t = `${p.title} ${p.category}`.toLowerCase();
+      const accessoryWords = [
+        "case","carcasa","funda","cover","sleeve","estuche","forro",
+        "mochila","backpack","maletin","maletín","bolso","morral",
+        "mouse","raton","ratón","teclado","keyboard","headset","diadema",
+        "audifono","audífono","auricular","earbud","webcam",
+        "cargador","charger","adaptador","cable","dock","docking","hub",
+        "soporte","stand","base refrigerante","cooling pad",
+        "memoria usb","pendrive","usb-c","powerbank","power bank",
+        "mousepad","mouse pad","gift","regalo","kit",
+      ];
+      if (accessoryWords.some(w => t.includes(w))) return false;
+
+      // Handhelds (ROG Ally / XBOX Ally) NO son laptops y no estan en stock.
+      // Cuestan >$1M asi que el piso de precio no los atrapa; se filtran aqui.
+      const handheldWords = ["ally","xbox ally","rog ally","steam deck","handheld"];
+      if (handheldWords.some(w => t.includes(w))) return false;
+
+      // Piso de precio: ninguna laptop ASUS en CLP baja de ~$200.000.
+      // Accesorios (cases, mouse) estan muy por debajo -> se descartan.
+      if (offer > 0 && offer < 1000000) return false;
+
       return true;
     });
-
-    console.log(`✅ Catálogo CL cargado: ${catalog.length} productos activos`);
+    console.log(`✅ Catálogo CO cargado: ${catalog.length} productos activos`);
   } catch (err) {
-    console.error("❌ Error actualizando catálogo CL:", err.message);
+    console.error("❌ Error actualizando catálogo CO:", err.message);
   }
 }
 
 const SINONIMOS = {
   gaming:        ["gamer","jugar","juego","juegos","game","fortnite","lol","valorant","rtx","nvidia","rog","tuf","strix"],
-  trabajo:       ["trabajar","trabajo","oficina","excel","word","empresa","corporativo","negocios","office","pega"],
-  universidad:   ["uni","universidad","estudio","estudiar","colegio","escuela","tarea","académico","u"],
+  trabajo:       ["trabajar","trabajo","oficina","excel","word","empresa","corporativo","negocios","office","parche"],
+  universidad:   ["uni","universidad","estudio","estudiar","colegio","escuela","tarea","académico","la u"],
   diseño:        ["diseño","diseñar","photoshop","illustrator","editar","edición","video","fotos","creator","creativo"],
-  economico:     ["barata","barato","económico","economico","precio","costo","accesible","low","presupuesto","lucas","luca","pesos","plata"],
-  potente:       ["potente","poderosa","poderoso","mejor","top","gama alta","rápida","rápido","rapida","rapido","rendimiento","bacán","bacan"],
+  economico:     ["barata","barato","económico","economico","precio","costo","accesible","low","presupuesto","pesos","plata","lucas","luca","palos","palo"],
+  potente:       ["potente","poderosa","poderoso","mejor","top","gama alta","rápida","rápido","rapida","rapido","rendimiento","bacan","bacán"],
   liviana:       ["liviana","liviano","ligera","ligero","portatil","portátil","fácil de llevar","pequeña","pequeño","delgada"],
   pantalla:      ["pantalla","panta","display","oled","resolución","resolucion"],
   memoria:       ["ram","memoria","16gb","8gb","32gb","4gb","gb","ddr","ddr5","ddr4"],
@@ -166,69 +309,117 @@ const SINONIMOS = {
   handheld:      ["ally","handheld","consola","portatil","portable","xbox","gamepass","game pass","steam","steam deck","mini consola","joystick","control"],
 };
 
-function searchProducts(query) {
-  const q = query.toLowerCase();
-  const words = q.split(/\s+/).filter(w => w.length > 1);
+// Extrae un techo de presupuesto en CLP. En Chile:
+//   "palo"/"palo verde"/"millon" = 1.000.000  (ej "1 palo" = 1.000.000)
+//   "luca"/"mil"                  = 1.000      (ej "800 lucas"/"900 mil" = 800.000/900.000)
+//   monto directo: "1.200.000", "1200000"
+// Tambien acepta "millones" por si lo dicen. Devuelve null si no hay monto.
+function extractBudget(q) {
+  // 1) millones / palos -> x 1.000.000
+  let m = q.match(/(\d+(?:[.,]\d+)?)\s*(millones|millon|millón|palos\s+verdes|palo\s+verde|palos|palo)\b/i);
+  if (m) return Math.round(parseFloat(m[1].replace(",", ".")) * 1000000);
+  // 2) lucas / mil -> x 1.000  (ej "800 lucas", "900 mil", "500 luca")
+  m = q.match(/(\d+(?:[.,]\d+)?)\s*(lucas|luca|mil)\b/i);
+  if (m) return Math.round(parseFloat(m[1].replace(",", ".")) * 1000);
+  // 3) monto directo con separadores: 1.200.000 / 1200000 / 1,200,000
+  m = q.match(/(\d[\d.,]{5,})/);
+  if (m) {
+    const n = parseInt(m[1].replace(/[.,]/g, ""), 10);
+    if (n >= 100000) return n; // piso CLP mas bajo que CO (precios chilenos menores)
+  }
+  return null;
+}
 
+// Una laptop es "gaming" solo si tiene GPU dedicada NVIDIA o es linea gaming.
+// Radeon integrada / Intel Graphics / Arc / Adreno = NO gaming.
+function isGamingProduct(p) {
+  const t = `${p.title} ${p.description} ${p.category}`.toLowerCase();
+  if (/integrad|intel graphics|intel hd|adreno|radeon graphics|radeon integrada/.test(t)) {
+    // graficos integrados: solo es gaming si ademas menciona RTX/GTX dedicada
+    return /\brtx\s*\d{3,4}|\bgtx\s*\d{3,4}/.test(t);
+  }
+  return /gaming|\btuf\b|\brog\b|strix|\brtx\b|\bgtx\b|nitro/.test(t);
+}
+
+function searchProducts(query, wantsGamingCtx) {
+  const q = query.toLowerCase();
+  const wantsGaming = wantsGamingCtx || SINONIMOS.gaming.some(g => q.includes(g));
+  const words = q.split(/\s+/).filter(w => w.length > 1);
   const expanded = new Set(words);
   for (const [_cat, syns] of Object.entries(SINONIMOS)) {
-    if (syns.some(s => q.includes(s)) || words.some(w => syns.includes(w))) {
-      syns.forEach(s => expanded.add(s));
-    }
+    if (syns.some(s => q.includes(s)) || words.some(w => syns.includes(w))) syns.forEach(s => expanded.add(s));
   }
   const allWords = [...expanded];
-
   if (allWords.length === 0) return catalog.slice(0, CONFIG.MAX_PRODUCTS_IN_PROMPT);
-
   const scored = catalog.map(product => {
     const text = `${product.title} ${product.description} ${product.category} ${product.brand} ${product.model} ${product.link}`.toLowerCase();
     let score = allWords.reduce((acc, w) => acc + (text.includes(w) ? 1 : 0), 0);
     words.forEach(w => { if (text.includes(w)) score += 5; });
     return { product, score };
   });
+  let results = scored.filter(s => s.score > 0).sort((a, b) => b.score - a.score).slice(0, CONFIG.MAX_PRODUCTS_IN_PROMPT).map(s => s.product);
 
-  const results = scored
-    .filter(s => s.score > 0)
-    .sort((a, b) => b.score - a.score)
-    .slice(0, CONFIG.MAX_PRODUCTS_IN_PROMPT)
-    .map(s => s.product);
-
-  const budgetWords = ["barata","barato","económico","economico","precio","accesible","presupuesto","lucas","luca","pesos","bajos","low","cheap","plata"];
-  const isBudgetQuery = budgetWords.some(w => q.includes(w));
-
-  if (isBudgetQuery && results.length > 0) {
-    return results.sort((a, b) => (parseFloat(a.price) || 999999) - (parseFloat(b.price) || 999999));
+  // ── Filtro por PRESUPUESTO: si el cliente dio un monto, descarta lo que se pase ──
+  const budget = extractBudget(q);
+  if (budget) {
+    let within = catalog.filter(p => {
+      const price = parseFloat(p.price) || 0;
+      return price > 0 && price <= budget;
+    });
+    // Si el contexto es gaming, EXCLUIR las no-gaming (no solo priorizar).
+    if (wantsGaming) {
+      const onlyGaming = within.filter(isGamingProduct);
+      within = onlyGaming; // si queda vacio, el server avisa honestamente
+    }
+    if (within.length > 0) {
+      const ranked = within.map(p => {
+        const t = `${p.title} ${p.description} ${p.category}`.toLowerCase();
+        let s = allWords.reduce((a, w) => a + (t.includes(w) ? 1 : 0), 0);
+        return { p, s, price: parseFloat(p.price) || 0 };
+      }).sort((a, b) => b.s - a.s || a.price - b.price);
+      return ranked.map(r => r.p).slice(0, CONFIG.MAX_PRODUCTS_IN_PROMPT);
+    }
+    return [];
   }
 
+  // Sin monto explicito: si el contexto es gaming, filtra a solo gaming.
+  if (wantsGaming) {
+    let onlyGaming = results.filter(isGamingProduct);
+    // Si el scoring no trajo gaming (ej. query de refinamiento "mas economica"
+    // sin palabras de producto), usa TODO el catalogo gaming ordenado por precio.
+    if (onlyGaming.length === 0) {
+      onlyGaming = catalog.filter(isGamingProduct).sort((a, b) => (parseFloat(a.price)||999999) - (parseFloat(b.price)||999999));
+    }
+    if (onlyGaming.length > 0) {
+      // si la query pide economico, ordena por precio
+      if (/(barat|economic|económic|menos|presupuesto)/i.test(q)) {
+        onlyGaming = [...onlyGaming].sort((a, b) => (parseFloat(a.price)||999999) - (parseFloat(b.price)||999999));
+      }
+      return onlyGaming.slice(0, CONFIG.MAX_PRODUCTS_IN_PROMPT);
+    }
+    return []; // pidio gaming y no hay -> server avisa honestamente
+  }
+
+  const budgetWords = ["barata","barato","económico","economico","precio","accesible","presupuesto","pesos","bajos","low","cheap","plata","lucas","luca","palos","palo"];
+  if (budgetWords.some(w => q.includes(w)) && results.length > 0) {
+    return results.sort((a, b) => (parseFloat(a.price) || 999999) - (parseFloat(b.price) || 999999));
+  }
   return results.length > 0 ? results : catalog.slice(0, CONFIG.MAX_PRODUCTS_IN_PROMPT);
 }
 
 function exactMatchProducts(query, results) {
   const q = query.toLowerCase();
-  const stopWords = ["busco","quiero","necesito","tengo","tiene","tienes","para","con","una","uno","un","el","la","los","las","del","que","algo","este","esta","ese","esa","hay","dame","dime","ver","cual","cuál","me","mi","su","tu","yo","por","muy","mas","más","po","poh","weon","hueon"];
-  const words = q.split(/\s+/)
-    .filter(w => w.length > 1)
-    .filter(w => !stopWords.includes(w));
-
+  const stopWords = ["busco","quiero","necesito","tengo","tiene","tienes","para","con","una","uno","un","el","la","los","las","del","que","algo","este","esta","ese","esa","hay","dame","dime","ver","cual","cuál","me","mi","su","tu","yo","por","muy","mas","más","pues","po","poh","weon","hueon","hueón","weón","cachai","cachái"];
+  const words = q.split(/\s+/).filter(w => w.length > 1).filter(w => !stopWords.includes(w));
   if (words.length === 0) return [];
-
   return results.filter(product => {
     const text = `${product.title} ${product.description} ${product.model} ${product.link}`.toLowerCase();
     const matches = words.every(w => text.includes(w));
     if (!matches) return false;
     const processorSearch = query.match(/\bi[3579]\b/i);
-    if (processorSearch) {
-      return text.includes(processorSearch[0].toLowerCase());
-    }
+    if (processorSearch) return text.includes(processorSearch[0].toLowerCase());
     return true;
   });
-}
-
-function formatProductsForPrompt(products) {
-  if (products.length === 0) return "No encontré productos que coincidan exactamente.";
-  return products.map(p =>
-    `• ${p.title}${p.brand ? ` (${p.brand})` : ""} — ${p.price}${p.category ? ` | Categoría: ${p.category}` : ""}${p.link ? ` | URL: ${p.link}` : ""}`
-  ).join("\n");
 }
 
 function calcPromo(regularPrice, price) {
@@ -236,71 +427,40 @@ function calcPromo(regularPrice, price) {
   const offer = parseFloat(price) || 0;
   const hasDiscount = regular > 0 && offer > 0 && regular > offer;
   if (!hasDiscount) return null;
-  return `${formatCLP(regular)} → ${formatCLP(offer)} ⚡ ¡Oferta!`;
+  return `${formatCLP(regular)} → ${formatCLP(offer)} ¡Oferta!`;
 }
 
 async function askClaude(conversationId, userMessage) {
   const relevant = searchProducts(userMessage);
-  const productList = formatProductsForPrompt(relevant);
-
   if (!conversations[conversationId]) conversations[conversationId] = [];
   const history = conversations[conversationId];
-
-  const systemPrompt = `Eres un asistente de ventas amigable y experto de esta tienda online.
-Tu objetivo es ayudar al cliente a encontrar el producto perfecto según sus necesidades.
-
-PRODUCTOS DISPONIBLES AHORA MISMO (en stock):
+  const productList = relevant.map(p => `• ${p.title} — ${p.price}${p.link ? ` | URL: ${p.link}` : ""}`).join("\n");
+  const systemPrompt = `Eres un asistente de ventas amigable y experto de esta tienda online ASUS Chile.
+PRODUCTOS DISPONIBLES:
 ${productList}
-
 INSTRUCCIONES:
-- Si no tienes suficiente información del cliente, haz UNA pregunta específica para entender mejor qué necesita.
-- Cuando recomiendas, explica brevemente POR QUÉ ese producto encaja con lo que pidió.
-- Recomienda máximo 2-3 productos. Siempre incluye el link del producto.
-- Si el producto no está en la lista de disponibles, no lo menciones.
-- Responde siempre en el mismo idioma en que te escribe el cliente.
-- Sé conciso: respuestas cortas, conversacionales.`;
-
-  const messages = [
-    ...history.slice(-CONFIG.CONVERSATION_HISTORY),
-    { role: "user", content: userMessage },
-  ];
-
-  const response = await anthropic.messages.create({
-    model: "claude-haiku-4-5-20251001",
-    max_tokens: 500,
-    system: systemPrompt,
-    messages,
-  });
-
+- Haz UNA pregunta específica si necesitas más info.
+- Explica brevemente POR QUÉ el producto encaja con lo que pidió.
+- Recomienda máximo 2-3 productos con su link.
+- Solo menciona productos de la lista.
+- Responde en el mismo idioma del cliente. Sé conciso.`;
+  const messages = [...history.slice(-CONFIG.CONVERSATION_HISTORY), { role: "user", content: userMessage }];
+  const response = await anthropic.messages.create({ model: "claude-haiku-4-5-20251001", max_tokens: 500, system: systemPrompt, messages });
   const reply = response.content[0].text;
   history.push({ role: "user", content: userMessage });
   history.push({ role: "assistant", content: reply });
-  if (history.length > CONFIG.CONVERSATION_HISTORY * 2) {
-    conversations[conversationId] = history.slice(-CONFIG.CONVERSATION_HISTORY * 2);
-  }
+  if (history.length > CONFIG.CONVERSATION_HISTORY * 2) conversations[conversationId] = history.slice(-CONFIG.CONVERSATION_HISTORY * 2);
   return reply;
 }
 
 async function replyOnFreshchat(conversationId, actorId, text) {
   const url = `https://api.freshchat.com/v2/conversations/${conversationId}/messages`;
-  const body = {
-    message_type: "normal",
-    actor_type: "agent",
-    actor_id: actorId,
-    message_parts: [{ text: { content: text } }],
-  };
   const res = await fetch(url, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${CONFIG.FRESHCHAT_TOKEN}`,
-    },
-    body: JSON.stringify(body),
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${CONFIG.FRESHCHAT_TOKEN}` },
+    body: JSON.stringify({ message_type: "normal", actor_type: "agent", actor_id: actorId, message_parts: [{ text: { content: text } }] }),
   });
-  if (!res.ok) {
-    const err = await res.text();
-    throw new Error(`Freshchat API error ${res.status}: ${err}`);
-  }
+  if (!res.ok) throw new Error(`Freshchat API error ${res.status}: ${await res.text()}`);
 }
 
 app.post("/webhook/freshchat", async (req, res) => {
@@ -312,13 +472,11 @@ app.post("/webhook/freshchat", async (req, res) => {
     const conversationId = event.conversation?.id;
     const agentId = event.conversation?.assigned_agent_id;
     if (!conversationId) return;
-    const userMessage = event.messages
-      .map(m => m.message_parts?.map(p => p.text?.content).filter(Boolean).join(" "))
-      .filter(Boolean).join(" ").trim();
+    const userMessage = event.messages.map(m => m.message_parts?.map(p => p.text?.content).filter(Boolean).join(" ")).filter(Boolean).join(" ").trim();
     if (!userMessage) return;
-    console.log(`💬 [${conversationId}] Usuario: ${userMessage}`);
+    console.log(`[${conversationId}] Usuario: ${userMessage}`);
     const reply = await askClaude(conversationId, userMessage);
-    console.log(`🤖 [${conversationId}] Claude: ${reply.slice(0, 80)}...`);
+    console.log(`[${conversationId}] Claude: ${reply.slice(0, 80)}...`);
     await replyOnFreshchat(conversationId, agentId, reply);
   } catch (err) {
     console.error("❌ Error procesando webhook:", err.message);
@@ -330,121 +488,64 @@ app.get("/health", (req, res) => {
 });
 
 app.get("/catalog/search", (req, res) => {
-  const q = req.query.q || "";
-  res.json(searchProducts(q));
+  res.json(searchProducts(req.query.q || ""));
 });
 
 app.get("/anastasia", async (req, res) => {
   const tStart = Date.now();
   const query = req.query.q || req.query.query || req.query.busqueda || "";
   const ip = req.headers["x-forwarded-for"] || req.socket.remoteAddress || "unknown";
-  console.log(`🤖 AnastasIA CL consulta: "${query}"`);
+  const sessionId = req.query.session || req.query.session_id || "";
+  const session = getSession(sessionId); // null si no mandan session
+  updateProfile(session, query); // mantiene el perfil acumulado (usos + presupuesto)
+  console.log(`AnastasIA CL consulta: "${query}"${sessionId ? ` [${sessionId}]` : ""}`);
   if (!query) return res.json({ items: [] });
 
   // ── Guardrail 0: URL detector ────────────────────────────────────
   if (query.startsWith("http://") || query.startsWith("https://")) {
-    console.log(`⚠️ URL detectada de IP ${ip}`);
     return res.json({
       message: "Solo puedo ayudarte con recomendaciones de laptops ASUS. ¿Qué tipo de laptop estás buscando?",
-      items: [{
-        TITLE: "Explora nuestras laptops ASUS",
-        TITLE_DISPLAY: "Ver laptops disponibles",
-        PRECIO_REGULAR_FORMAT: "",
-        PRECIO_OFERTA_FORMAT: "",
-        PRECIO_REGULAR: 0,
-        PRECIO_OFERTA: 0,
-        URL: "https://www.asus.com/cl/store/",
-        IMAGEN: "https://dlcdnwebimgs.asus.com/gain/34B7D53B-C42E-4F15-8B95-7EDA7F64F22C/w800",
-        SPECS: "Gaming · Trabajo · Universidad · Diseño",
-        PROMO: "🚀 Encuentra tu laptop ideal hoy"
-      }]
+      items: [{ TITLE: "Explora nuestras laptops ASUS", TITLE_DISPLAY: "Ver laptops disponibles", PRECIO_REGULAR_FORMAT: "", PRECIO_OFERTA_FORMAT: "", PRECIO_REGULAR: 0, PRECIO_OFERTA: 0, URL: "https://www.asus.com/cl/store/", IMAGEN: "https://dlcdnwebimgs.asus.com/gain/34B7D53B-C42E-4F15-8B95-7EDA7F64F22C/w800", SPECS: "Gaming · Trabajo · Universidad · Diseño", PROMO: "Encuentra tu laptop ideal hoy" }]
     });
   }
 
   // ── Guardrail 1: Query length ────────────────────────────────────
   if (query.length > CONFIG.MAX_QUERY_LENGTH) {
-    console.log(`⚠️ Query demasiado larga (${query.length} chars) de IP ${ip}`);
     return res.json({
-      message: "Tu mensaje es muy largo. Por favor escribe una consulta más corta, como por ejemplo: 'laptop para gaming' o 'laptop económica para estudiantes'.",
-      items: [{
-        TITLE: "Explora nuestras laptops ASUS",
-        TITLE_DISPLAY: "Ver laptops disponibles",
-        PRECIO_REGULAR_FORMAT: "",
-        PRECIO_OFERTA_FORMAT: "",
-        PRECIO_REGULAR: 0,
-        PRECIO_OFERTA: 0,
-        URL: "https://www.asus.com/cl/store/",
-        IMAGEN: "https://dlcdnwebimgs.asus.com/gain/34B7D53B-C42E-4F15-8B95-7EDA7F64F22C/w800",
-        SPECS: "Gaming · Trabajo · Universidad · Diseño",
-        PROMO: "🚀 Encuentra tu laptop ideal hoy"
-      }]
+      message: "Tu mensaje es muy largo. Por favor escribe una consulta más corta.",
+      items: [{ TITLE: "Explora nuestras laptops ASUS", TITLE_DISPLAY: "Ver laptops disponibles", PRECIO_REGULAR_FORMAT: "", PRECIO_OFERTA_FORMAT: "", PRECIO_REGULAR: 0, PRECIO_OFERTA: 0, URL: "https://www.asus.com/cl/store/", IMAGEN: "https://dlcdnwebimgs.asus.com/gain/34B7D53B-C42E-4F15-8B95-7EDA7F64F22C/w800", SPECS: "Gaming · Trabajo · Universidad · Diseño", PROMO: "Encuentra tu laptop ideal hoy" }]
     });
   }
 
   // ── Guardrail 2: Rate limiting ───────────────────────────────────
   if (isRateLimited(ip)) {
-    console.log(`⚠️ Rate limit alcanzado para IP ${ip}`);
     return res.json({
-      message: "Has realizado demasiadas consultas en poco tiempo. Por favor espera unos minutos e intenta de nuevo. 😊",
-      items: [{
-        TITLE: "Servicio al Cliente ASUS Chile",
-        TITLE_DISPLAY: "Contáctanos directamente",
-        PRECIO_REGULAR_FORMAT: "",
-        PRECIO_OFERTA_FORMAT: "",
-        PRECIO_REGULAR: 0,
-        PRECIO_OFERTA: 0,
-        URL: "https://www.asus.com/microsite/pick_and_fix/cl/",
-        IMAGEN: "https://www.asus.com/media/global/gallery/lVTlQHxDPCyHhWVU_setting_fff_1_90_end_1000.png",
-        SPECS: "Lunes-Viernes 08:00-18:00 · Sábado 10:00-15:00",
-        PROMO: "📞 800-835-994 · Llamada gratuita"
-      }]
+      message: "Has hecho varias consultas seguidas. Dame un momentico y vuelve a intentar — o si prefieres, habla directo con un asesor.",
+      escalate: true,
+      items: []
     });
   }
 
   // ── Guardrail 3: Spam detection ──────────────────────────────────
   if (isSpam(ip, query)) {
-    console.log(`⚠️ Spam detectado de IP ${ip}: "${query}"`);
     return res.json({
-      message: "Parece que estás repitiendo la misma búsqueda. ¿Puedo ayudarte con algo más específico? 😊",
-      items: [{
-        TITLE: "Explora nuestras laptops ASUS",
-        TITLE_DISPLAY: "Ver laptops disponibles",
-        PRECIO_REGULAR_FORMAT: "",
-        PRECIO_OFERTA_FORMAT: "",
-        PRECIO_REGULAR: 0,
-        PRECIO_OFERTA: 0,
-        URL: "https://www.asus.com/cl/store/",
-        IMAGEN: "https://dlcdnwebimgs.asus.com/gain/34B7D53B-C42E-4F15-8B95-7EDA7F64F22C/w800",
-        SPECS: "Gaming · Trabajo · Universidad · Diseño",
-        PROMO: "🚀 Encuentra tu laptop ideal hoy"
-      }]
+      message: "Parece que estás repitiendo la misma búsqueda. ¿Puedo ayudarte con algo más específico?",
+      items: [{ TITLE: "Explora nuestras laptops ASUS", TITLE_DISPLAY: "Ver laptops disponibles", PRECIO_REGULAR_FORMAT: "", PRECIO_OFERTA_FORMAT: "", PRECIO_REGULAR: 0, PRECIO_OFERTA: 0, URL: "https://www.asus.com/cl/store/", IMAGEN: "https://dlcdnwebimgs.asus.com/gain/34B7D53B-C42E-4F15-8B95-7EDA7F64F22C/w800", SPECS: "Gaming · Trabajo · Universidad · Diseño", PROMO: "Encuentra tu laptop ideal hoy" }]
     });
   }
 
   // ── Guardrail 4: Off-topic detection ─────────────────────────────
   if (isOffTopic(query)) {
-    console.log(`⚠️ Consulta off-topic de IP ${ip}: "${query}"`);
     return res.json({
-      message: "Solo puedo ayudarte con laptops ASUS. ¿Estás buscando una laptop para gaming, trabajo, universidad o diseño? 😊",
-      items: [{
-        TITLE: "Explora nuestras laptops ASUS",
-        TITLE_DISPLAY: "Ver laptops disponibles",
-        PRECIO_REGULAR_FORMAT: "",
-        PRECIO_OFERTA_FORMAT: "",
-        PRECIO_REGULAR: 0,
-        PRECIO_OFERTA: 0,
-        URL: "https://www.asus.com/cl/store/",
-        IMAGEN: "https://dlcdnwebimgs.asus.com/gain/34B7D53B-C42E-4F15-8B95-7EDA7F64F22C/w800",
-        SPECS: "Gaming · Trabajo · Universidad · Diseño",
-        PROMO: "🚀 Encuentra tu laptop ideal hoy"
-      }]
+      message: "Solo puedo ayudarte con laptops ASUS. ¿Estás buscando una laptop para gaming, trabajo, universidad o diseño?",
+      items: [{ TITLE: "Explora nuestras laptops ASUS", TITLE_DISPLAY: "Ver laptops disponibles", PRECIO_REGULAR_FORMAT: "", PRECIO_OFERTA_FORMAT: "", PRECIO_REGULAR: 0, PRECIO_OFERTA: 0, URL: "https://www.asus.com/cl/store/", IMAGEN: "https://dlcdnwebimgs.asus.com/gain/34B7D53B-C42E-4F15-8B95-7EDA7F64F22C/w800", SPECS: "Gaming · Trabajo · Universidad · Diseño", PROMO: "Encuentra tu laptop ideal hoy" }]
     });
   }
 
   try {
     const q = query.toLowerCase();
 
-    // ── Sales redirect — BEFORE service ─────────────────────────────
+    // ── Sales redirect ───────────────────────────────────────────────
     const salesWords = [
       "cupon","cupón","codigo descuento","código descuento","promocion","promoción",
       "pedido","mi orden","mi compra","pago","factura","boleta",
@@ -452,36 +553,24 @@ app.get("/anastasia", async (req, res) => {
       "reposicion","reposición","restock","cuando llega","cuando estará","cuándo estará","cuando va a llegar",
       "tiendas","donde comprar","distribuidor","punto de venta",
       "devolucion","devolución","cambio de producto","reclamo","queja",
+      "asesor","asesores","agente humano","hablar con humano","hablar con persona","hablar con alguien","persona real",
     ];
-    if (salesWords.some(w => q.includes(w))) {
-      console.log(`💼 Consulta de ventas de IP ${ip}: "${query}"`);
+    if (hasWord(q, salesWords)) {
       return res.json({
-        message: "Para consultas sobre cupones, pedidos o promociones, nuestros asesores de ventas pueden ayudarte. Reinicia el chat y selecciona 'Hablar con un asesor', o escríbenos a soporteventas_cl@asus.com 📧",
-        items: [{
-          TITLE: "Asesores de Ventas ASUS Chile",
-          TITLE_DISPLAY: "Contactar asesor de ventas",
-          PRECIO_REGULAR_FORMAT: "",
-          PRECIO_OFERTA_FORMAT: "",
-          PRECIO_REGULAR: 0,
-          PRECIO_OFERTA: 0,
-          URL: "https://www.asus.com/cl/store/",
-          IMAGEN: "https://dlcdnwebimgs.asus.com/gain/34B7D53B-C42E-4F15-8B95-7EDA7F64F22C/w800",
-          SPECS: "Lunes-Viernes 08:00-18:00 · Sábado 10:00-15:00",
-          PROMO: "📧 soporteventas_cl@asus.com"
-        }]
+        message: "Para consultas sobre cupones, pedidos o promociones, uno de nuestros asesores de ventas te puede ayudar. Da clic abajo para hablar con un asesor.",
+        escalate: true,
+        items: []
       });
     }
 
-    // ── Customer service redirect — BEFORE search ────────────────────
-    // Nota: "bateria"/"batería"/"battery"/"pila" se manejan abajo con detección contextual
-    // para no bloquear consultas legítimas de compra ("laptop con buena duración de batería").
+    // ── Service redirect ─────────────────────────────────────────────
     const serviceWords = [
       "cargador","cargadora","charger","cable carga","adaptador","fuente de poder",
       "bateria hinchada","bateria de repuesto","cambio de bateria",
       "pantalla rota","reemplazo de pantalla","cambio de pantalla","pantalla de repuesto",
       "reparacion","reparación","repair","repuesto","repuestos","spare part","pieza","componente",
       "arreglar","arreglo","tecnico","técnico","servicio tecnico","servicio técnico",
-      "motherboard","placa madre","tarjeta madre",
+      "motherboard","motherboards","placa madre","placas madre","tarjeta madre","tarjetas madre",
       "tarjeta grafica","tarjeta gráfica","graphics card","gpu externa",
       "psu","fuente de alimentacion","fuente de alimentación",
       "ram suelta","memoria ram suelta","disco duro","hdd",
@@ -496,290 +585,557 @@ app.get("/anastasia", async (req, res) => {
       "wifi no funciona","no conecta","no se conecta",
       "instalar windows","activar windows","actualizacion","actualizar",
       "wifi","wi-fi","access point","punto de acceso","switch de red","hub de red",
-      "ups","no break","estabilizador",
-      "proyector","smartwatch","reloj inteligente"
+      "ups","no break","estabilizador","proyector","smartwatch","reloj inteligente",
     ];
-
-    // Detección contextual de batería: solo redirige a servicio técnico si hay
-    // contexto de problema/repuesto Y NO hay contexto de feature/compra.
     const mentionsBattery = /\b(bateria|batería|battery|pila)\b/.test(q);
     const batteryProblem = mentionsBattery && /(hinchada|no carga|no funciona|repuesto|reemplaz|rota|muerta|dañ|estallad|inflada)/.test(q);
-    const batteryFeature = mentionsBattery && /(duracion|duración|autonomia|autonomía|horas|dura|larga|buena|precio|hasta|pesos|lucas|busco|quiero|recomienda|presupuesto)/.test(q);
-
-    const isServiceRequest = serviceWords.some(w => q.includes(w)) || (batteryProblem && !batteryFeature);
-
-    if (isServiceRequest) {
+    const batteryFeature = mentionsBattery && /(duracion|duración|autonomia|autonomía|horas|dura|larga|buena|precio|hasta|pesos|millones|busco|quiero|recomienda|presupuesto)/.test(q);
+    if (hasWord(q, serviceWords) || (batteryProblem && !batteryFeature)) {
       return res.json({
-        message: "Lo sentimos, este producto o servicio no está disponible en nuestra tienda online ASUS Chile. Para más información contacta a nuestro equipo de soporte técnico:",
-        items: [{
-          TITLE: "Servicio al Cliente ASUS Chile",
-          TITLE_DISPLAY: "Contáctanos para ayudarte",
-          PRECIO_REGULAR_FORMAT: "",
-          PRECIO_OFERTA_FORMAT: "",
-          PRECIO_REGULAR: 0,
-          PRECIO_OFERTA: 0,
-          URL: "https://www.asus.com/microsite/pick_and_fix/cl/",
-          IMAGEN: "https://www.asus.com/media/global/gallery/lVTlQHxDPCyHhWVU_setting_fff_1_90_end_1000.png",
-          SPECS: "Lunes-Viernes 08:00-18:00 · Sábado 10:00-15:00",
-          PROMO: "📞 800-835-994 · Llamada gratuita"
-        }]
+        message: "Esa consulta la maneja mejor nuestro equipo de soporte. Da clic abajo para hablar con un asesor y resolverla.",
+        escalate: true,
+        items: []
       });
     }
 
-    // ── ROG Ally / handheld redirect — BEFORE search ─────────────────
+    // ── ROG Ally redirect ────────────────────────────────────────────
     const isHandheld = q.includes("ally") || q.includes("rog ally") ||
       (q.includes("handheld") && !q.includes("laptop")) ||
       q.includes("steam deck") ||
       (q.includes("consola") && q.includes("portatil"));
-
     if (isHandheld) {
       return res.json({
-        message: "¡Lo sentimos! La ROG Ally no está disponible en stock en este momento. ¡Vuelve pronto! 🎮 ¿Te puedo ayudar a encontrar una laptop gaming mientras tanto?",
-        items: [{
-          TITLE: "ROG Ally — Sin stock por ahora",
-          TITLE_DISPLAY: "Vuelve pronto · Próximamente",
-          PRECIO_REGULAR_FORMAT: "",
-          PRECIO_OFERTA_FORMAT: "",
-          PRECIO_REGULAR: 0,
-          PRECIO_OFERTA: 0,
-          URL: "https://www.asus.com/cl/store/",
-          IMAGEN: "https://dlcdnwebimgs.asus.com/gain/34B7D53B-C42E-4F15-8B95-7EDA7F64F22C/w800",
-          SPECS: "Consola portátil gaming · Sin stock por ahora",
-          PROMO: "🎮 Próximamente disponible"
-        }]
+        message: "La ROG Ally no está disponible en stock en este momento. ¿Te puedo ayudar a encontrar una laptop gaming mientras tanto?",
+        items: [{ TITLE: "ROG Ally - Sin stock por ahora", TITLE_DISPLAY: "Vuelve pronto - Proximamente", PRECIO_REGULAR_FORMAT: "", PRECIO_OFERTA_FORMAT: "", PRECIO_REGULAR: 0, PRECIO_OFERTA: 0, URL: "https://www.asus.com/cl/store/", IMAGEN: "https://dlcdnwebimgs.asus.com/gain/34B7D53B-C42E-4F15-8B95-7EDA7F64F22C/w800", SPECS: "Consola portatil gaming - Sin stock por ahora", PROMO: "Proximamente disponible" }]
       });
     }
 
-    // ── Non-laptop products redirect — BEFORE search ─────────────────
+    // ── Non-laptop redirect ──────────────────────────────────────────
     const nonLaptopWords = [
       "torre","desktop","pc de escritorio","computadora de escritorio",
       "all in one","all-in-one","rog pc","rog desktop","mini pc","nuc",
-      "monitor externo","pantalla externa",
-      "tablet","ipad",
-      "servidor","server","nas",
-      "componentes","armar pc","build pc","pc armada","procesador suelto",
-      "television","televisor","smart tv",
-      "smartwatch","reloj inteligente",
-      "proyector","ups","estabilizador",
-      // Accesorios de transporte
+      "monitor externo","pantalla externa","tablet","ipad",
+      "servidor","server","nas","componentes","armar pc","build pc","pc armada","procesador suelto",
+      "television","televisor","smart tv","smartwatch","reloj inteligente","proyector","ups","estabilizador",
       "bolso","mochila","maletin","maletín","funda","estuche","backpack","forro",
-      // Periféricos / accesorios
       "mouse","keyboard","teclado externo","audifonos","audífonos","headset","webcam","auriculares","auricular",
-      "parlante","bocina","altavoz"
+      "parlante","bocina","altavoz",
     ];
-    const isNonLaptop = nonLaptopWords.some(w => q.includes(w)) ||
-      (q.includes("monitor") && !q.includes("laptop") && !q.includes("pantalla de laptop"));
-
-    if (isNonLaptop) {
+    if (hasWord(q, nonLaptopWords) || (q.includes("monitor") && !q.includes("laptop") && !q.includes("pantalla de laptop"))) {
       return res.json({
-        message: "Por el momento solo contamos con laptops ASUS en nuestra tienda online en Chile. ¡Tenemos opciones increíbles para gaming, trabajo, diseño y más! ¿Te ayudo a encontrar la laptop perfecta para ti?",
-        items: [{
-          TITLE: "Explora nuestras laptops ASUS",
-          TITLE_DISPLAY: "Ver laptops disponibles",
-          PRECIO_REGULAR_FORMAT: "",
-          PRECIO_OFERTA_FORMAT: "",
-          PRECIO_REGULAR: 0,
-          PRECIO_OFERTA: 0,
-          URL: "https://www.asus.com/cl/store/",
-          IMAGEN: "https://dlcdnwebimgs.asus.com/gain/34B7D53B-C42E-4F15-8B95-7EDA7F64F22C/w800",
-          SPECS: "Gaming · Trabajo · Universidad · Diseño",
-          PROMO: "🚀 Encuentra tu laptop ideal hoy"
-        }]
+        message: "Por el momento solo contamos con laptops ASUS en nuestra tienda online en Chile. ¿Te ayudo a encontrar la laptop perfecta para ti?",
+        items: [{ TITLE: "Explora nuestras laptops ASUS", TITLE_DISPLAY: "Ver laptops disponibles", PRECIO_REGULAR_FORMAT: "", PRECIO_OFERTA_FORMAT: "", PRECIO_REGULAR: 0, PRECIO_OFERTA: 0, URL: "https://www.asus.com/cl/store/", IMAGEN: "https://dlcdnwebimgs.asus.com/gain/34B7D53B-C42E-4F15-8B95-7EDA7F64F22C/w800", SPECS: "Gaming · Trabajo · Universidad · Diseño", PROMO: "Encuentra tu laptop ideal hoy" }]
       });
     }
 
-    // ── NOW search products ──────────────────────────────────────────
-    const relevant = searchProducts(query);
-    if (relevant.length === 0) return res.json({ items: [] });
+    // ── Ficha tecnica completa de UN modelo ──────────────────────────
+    // Si el cliente pide "specs completos / ficha tecnica" de un modelo,
+    // devolvemos una tarjeta de ficha (specSheet) en vez de texto plano.
+    const wantsFullSpecs = hasWord(q, [
+      "specs completos","especificaciones completas","ficha tecnica","ficha técnica",
+      "todos los specs","todas las especificaciones","specs de","especificaciones de",
+      "caracteristicas completas","características completas","detalles tecnicos","detalles técnicos",
+      "ficha completa","specs completas",
+    ]);
+    if (wantsFullSpecs) {
+      // Resolver a que producto se refiere: primero entre los ya mostrados,
+      // si no, buscar en el catalogo.
+      let target = null;
+      const qNorm = q.replace(/[^a-z0-9]/g, "");
+      const pool = (session && session.shownProducts.length)
+        ? session.shownProducts.map(sp => catalog.find(c => c.title === sp.title)).filter(Boolean)
+        : [];
+      const candidates = pool.length ? pool : searchProducts(query);
+      // Puntuar TODOS los candidatos y quedarnos con el mejor (no el primero
+      // que pase el umbral), para que "a15" gane sobre "a16" si pedis la a15.
+      const scoreOf = (p) => {
+        const model = (p.model || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+        const title = (p.title || "").toLowerCase();
+        const qWords = q.split(/\s+/).filter(w => w.length > 2);
+        let sc = qWords.filter(w => title.includes(w.replace(/[?¿!¡.,]/g, ""))).length;
+        if (model && model.length >= 4 && qNorm.includes(model)) sc += 5; // match por part-number = fuerte
+        return sc;
+      };
+      let best = null, bestScore = 0;
+      for (const p of candidates) {
+        const sc = scoreOf(p);
+        if (sc > bestScore) { bestScore = sc; best = p; }
+      }
+      target = (bestScore >= 2) ? best : null;
+      // "specs de esta/esta laptop" sin nombre claro -> usar la ultima mostrada
+      if (!target) {
+        if (/\b(esta|este|esa|ese|la misma|el mismo)\b/.test(q) && pool.length) target = pool[pool.length - 1];
+        else target = candidates[0];
+      }
 
-    // ── Detect query intent ──────────────────────────────────────────
-    const budgetWords = ["barata","barato","económico","economico","economica","económica","cheap","precio bajo","más barata","mas barata","menor precio","más económica","mas economica","low cost","accesible","lucas","luca","plata"];
-    const powerWords = ["potente","poderosa","poderoso","mejor","top","gama alta","más potente","mas potente","la mejor","lo mejor","high end","bacán","bacan"];
+      if (target) {
+        const tSheet = Date.now();
+        const promo = calcPromo(target.regularPrice, target.price);
+        const sheetResp = await anthropic.messages.create({
+          model: "claude-haiku-4-5-20251001",
+          max_tokens: 600,
+          system: `Eres AnastasIA, experta en laptops ASUS Chile. Te doy UN producto y debes armar su ficha tecnica.
+PRODUCTO: ${target.title}
+DESCRIPCION: ${target.description.replace(/"/g, "'")}
+Modelo: ${target.model} | Precio: ${target.price}
+
+Devuelve SOLO JSON valido sin markdown:
+{"intro":"1 frase corta presentando la laptop","specs":[{"label":"Procesador","value":"..."},{"label":"Memoria RAM","value":"..."},{"label":"Almacenamiento","value":"..."},{"label":"Pantalla","value":"..."},{"label":"Tarjeta grafica","value":"..."},{"label":"Sistema operativo","value":"..."}],"porque":"parrafo de 2-3 frases en español chileno explicando por que es buena opcion y para que usos brilla (gaming, AutoCAD, universidad, diseño). Natural y vendedor sin exagerar."}
+REGLAS: solo specs que aparezcan en la descripcion; si un spec no esta, omite ese objeto del array (no lo inventes). Incluye RAM ampliable si se menciona. Sin comillas dobles dentro de los valores.`,
+          messages: [{ role: "user", content: query }],
+        });
+        console.log(`Ficha tecnica: ${Date.now() - tSheet}ms`);
+        let sheet;
+        try {
+          let rawSheet = sheetResp.content[0].text.trim().replace(/```json|```/g, "").trim();
+          sheet = JSON.parse(rawSheet);
+        } catch {
+          // Fallback: armar la ficha desde la descripcion del catalogo,
+          // para NO caer al texto plano. Siempre sale la tarjeta.
+          const d = target.description;
+          const pick = (re) => { const m = d.match(re); return m ? m[0].trim() : ""; };
+          const specs = [];
+          const cpu = pick(/(amd\s+)?ryzen[\s\w]*?\d+\w*|core\s+(ultra\s+)?[i]?\d[\s\w-]*?\d*\w*|intel\s+core[\s\w-]*?\d+\w*/i);
+          const ram = pick(/\d{1,3}\s?gb\s+(ddr\d|lpddr\d\w*)/i);
+          const ssd = pick(/\d+\s?(gb|tb)\s+ssd/i);
+          const pan = pick(/\d{2}(\.\d)?\s?(pulg|"|oled|fhd|wuxga|qhd)\w*/i);
+          const gpu = pick(/(rtx|gtx)\s?\d{3,4}\s?(ti)?\s?(\d+gb)?|radeon[\s\w]*|arc[\s\w]*/i);
+          if (cpu) specs.push({ label: "Procesador", value: cpu });
+          if (ram) specs.push({ label: "Memoria RAM", value: ram });
+          if (ssd) specs.push({ label: "Almacenamiento", value: ssd });
+          if (pan) specs.push({ label: "Pantalla", value: pan });
+          if (gpu) specs.push({ label: "Tarjeta grafica", value: gpu });
+          sheet = {
+            intro: `Esta es la ficha de la ${target.title}:`,
+            specs,
+            porque: "Una opcion solida de ASUS. Para mas detalles tecnicos da clic en Ver producto y revisa la ficha completa en la tienda.",
+          };
+          console.log(`⚠️ Ficha: JSON fallo, armada desde catalogo (${specs.length} specs)`);
+        }
+
+        if (sheet) {
+          const sku = target.partNumber || target.model;
+          const regularNum = parseFloat(target.regularPrice) || parseFloat(target.price) || 0;
+          const offerNum   = parseFloat(target.price) || 0;
+          // guardar turno en memoria
+          if (session) {
+            session.history.push({ role: "user", content: query });
+            session.history.push({ role: "assistant", content: `[ficha tecnica de ${target.title}]` });
+            if (session.history.length > MAGENTO_HISTORY_TURNS * 2) session.history = session.history.slice(-MAGENTO_HISTORY_TURNS * 2);
+          }
+          return res.json({
+            message: sheet.intro || `Esta es la ficha de ${target.title}:`,
+            specSheet: {
+              TITLE: target.title,
+              IMAGEN: target.image,
+              SPECS_LIST: Array.isArray(sheet.specs) ? sheet.specs : [],
+              PORQUE: sheet.porque || "",
+              PRECIO_OFERTA_FORMAT: formatCLP(offerNum),
+              PRECIO_REGULAR_FORMAT: formatCLP(regularNum),
+              PRECIO_REGULAR: regularNum,
+              PRECIO_OFERTA: offerNum,
+              PROMO: promo || "",
+              URL: addUTM(target.link, sku),
+            },
+            items: [],
+          });
+        }
+        // si fallo el JSON, cae al follow-up normal abajo
+      }
+    }
+
+    // ── Deteccion de "eligio un modelo que ya vio" ───────────────────
+    // Si el cliente escribe el nombre de una laptop que YA le mostramos,
+    // no es una busqueda nueva: esta eligiendo. Lo tratamos como follow-up
+    // para confirmar su eleccion en vez de re-recomendar.
+    let isModelPick = false;
+    if (session && session.shownProducts.length) {
+      const qNorm = q.replace(/[^a-z0-9]/g, "");
+      isModelPick = session.shownProducts.some(p => {
+        const model = (p.model || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+        const title = (p.title || "").toLowerCase();
+        // match por modelo (ej "fa506ncg") o por nombre comercial corto del titulo
+        if (model && model.length >= 4 && qNorm.includes(model)) return true;
+        // match por nombre tipo "tuf gaming a15" presente en el titulo
+        const qWords = q.split(/\s+/).filter(w => w.length > 2);
+        const hit = qWords.filter(w => title.includes(w)).length;
+        return qWords.length >= 2 && hit >= 2;
+      });
+    }
+
+    // ── Follow-up / conversacional (responde sin re-recomendar) ──────
+    // Va DESPUÉS de los redirects de asesor/servicio (para que escalen bien)
+    // y ANTES de searchProducts (para cortar el camino del producto).
+    if (isFollowUp(q) || isModelPick) {
+      const tFollow = Date.now();
+
+      // Contexto de memoria: que laptops ya vio el cliente, para que pueda
+      // responder "cual me conviene" / "la primera" refiriendose a modelos reales.
+      const shown = session?.shownProducts || [];
+      const shownList = shown.length
+        ? `\nLaptops que el cliente YA vio en esta conversacion (puedes referirte a ellas por nombre):\n${shown.map((p, i) => `${i+1}. ${p.title} — ${p.specs || ""}`).join("\n")}`
+        : "";
+
+      // Historial reciente para que la respuesta tenga continuidad.
+      const histMsgs = session?.history?.slice(-MAGENTO_HISTORY_TURNS) || [];
+
+      const followResp = await anthropic.messages.create({
+        model: "claude-haiku-4-5-20251001",
+        max_tokens: 250,
+        system: `Eres AnastasIA, asesora de laptops ASUS Chile. Entiendes chilenismos pero respondes amigable y profesional.
+El cliente ya vio recomendaciones de laptops y ahora hace una pregunta de seguimiento (envío, garantía, pago, o cuál elegir).${shownList}
+REGLAS:
+- Responde SOLO la pregunta, en 1-2 frases cortas, español chileno natural.
+- NO listes tarjetas de producto nuevas. Si el cliente pregunta cual le conviene o elige una de las que vio, puedes mencionarla POR NOMBRE (de la lista de arriba) y dar un criterio breve, pero sin reabrir busqueda.
+- Si pregunta por envíos: en Chile la entrega suele ser 2-3 días hábiles según ciudad.
+- Si pregunta por garantía: las laptops ASUS tienen garantía oficial; los detalles los confirma el asesor.
+- Si pregunta por pago/financiación o checkout: se manejan varios medios de pago en la tienda; para finalizar la compra el cliente da clic en "Ver producto" y completa el checkout en la tienda. El asesor ayuda con el detalle.
+- Si elige un modelo: confirma su eleccion, felicitalo brevemente y dile que puede dar clic en "Ver producto" de esa laptop para comprarla. NO muestres otras.
+- Si es un agradecimiento o cierre: responde con cortesía breve y ofrece seguir ayudando.
+- Si el cliente reclama que falta un spec que pidio (ej: "pero no tiene i9", "ninguna tiene 32GB"): reconoce con honestidad que ahora mismo no hay en la tienda exactamente ese spec, y explica brevemente por que las que le mostraste igual le sirven (ej: "Cierto, justo ahora no tengo i9 disponible, pero el Ryzen 7 de la TUF rinde igual de bien para gaming"). NUNCA digas que una laptop tiene un spec que no tiene.
+- IDONEIDAD PARA GAMING (importante): si el cliente pregunta si una laptop especifica sirve para gaming, juzga HONESTAMENTE por su tarjeta grafica:
+  - Es buena para gaming SOLO si tiene GPU dedicada NVIDIA (RTX o GTX). Ej: RTX 5050, RTX 4050, RTX 3050.
+  - NO es para gaming si tiene graficos integrados (Radeon integrada, Intel Graphics, Intel Arc, Adreno, Radeon Graphics). Estas son para trabajo/estudio. Dilo claro: "esa es mas para trabajo y estudio, no para gaming exigente".
+  - Mira la lista de arriba para ver que GPU tiene la laptop por la que preguntan. NUNCA llames "gaming" a una con graficos integrados.
+- Devuelve SOLO texto plano, sin JSON, sin markdown.`,
+        messages: [...histMsgs, { role: "user", content: query }],
+      });
+      const followText = (followResp.content[0]?.text || "").trim();
+      console.log(`AnastasIA CL follow-up: ${Date.now() - tFollow}ms`);
+
+      // Guardar el turno en memoria.
+      if (session) {
+        session.history.push({ role: "user", content: query });
+        session.history.push({ role: "assistant", content: followText });
+        if (session.history.length > MAGENTO_HISTORY_TURNS * 2) session.history = session.history.slice(-MAGENTO_HISTORY_TURNS * 2);
+      }
+
+      return res.json({ message: followText, items: [] });
+    }
+
+    // ── Search products ──────────────────────────────────────────────
+    // ── Contexto desde el PERFIL acumulado de la conversacion ─────────
+    // El perfil (session.profile) ya tiene los usos que el cliente ha pedido
+    // (gaming, universidad...) y su presupuesto, y persiste hasta que cambie.
+    // Asi, si pidio gaming+u y ahora refina, NO perdemos el gaming.
+    const profile = session?.profile || { uses: [], budget: null };
+
+    // Enriquecer la busqueda con los usos del perfil que no esten ya en el query.
+    let searchQuery = query;
+    const queryLow = query.toLowerCase();
+    const useKeyword = { gaming: "gaming", universidad: "universidad", trabajo: "trabajo", diseño: "diseño", portatil: "portatil" };
+    profile.uses.forEach(u => {
+      const kw = useKeyword[u];
+      if (kw && !queryLow.includes(kw) && !USE_PATTERNS[u].test(queryLow)) {
+        searchQuery += ` ${kw}`;
+      }
+    });
+    // Si el cliente dio un presupuesto antes y ahora no menciona ninguno, lo aplicamos.
+    if (profile.budget && !extractBudget(queryLow)) {
+      searchQuery += ` ${profile.budget}`;
+    }
+
+    // Gaming context viene del perfil: si "gaming" esta entre los usos activos,
+    // filtramos a gaming real (sin importar que tambien quiera u/trabajo).
+    const gamingContext = profile.uses.includes("gaming");
+
+    const relevant = searchProducts(searchQuery, gamingContext);
+    if (relevant.length === 0) {
+      // Nada cabe: dejamos que Claude redacte el mensaje (natural y en tono de
+      // AnastasIA) en vez de un texto fijo. Le pasamos el presupuesto pedido y
+      // el precio mas bajo disponible para que oriente al cliente.
+      const budget = extractBudget(query.toLowerCase());
+      const cheapest = catalog.reduce((min, p) => {
+        const pr = parseFloat(p.price) || 0;
+        return (pr > 0 && pr < min) ? pr : min;
+      }, Infinity);
+      const cheapestTxt = cheapest !== Infinity ? formatCLP(cheapest) : "";
+      const noStockPrompt =
+        `Eres AnastasIA, asesora de laptops ASUS Chile. Hablas natural y amigable, con toques chilenos sin exagerar.
+El cliente pidio: "${query}".
+SITUACION: en la tienda NO hay ninguna laptop que encaje con ese pedido${budget ? ` (su presupuesto es ${formatCLP(budget)})` : ""}.${cheapestTxt ? ` La laptop mas economica disponible cuesta ${cheapestTxt}.` : ""}
+Escribe un mensaje corto (2-3 frases) que:
+- Diga con honestidad y sin drama que ahorita no tenemos algo en ese rango/criterio.
+- ${budget && cheapestTxt ? `Mencione que las opciones arrancan alrededor de ${cheapestTxt}, por si puede ajustar.` : "Pida un poco mas de detalle (uso o presupuesto) para ayudarle mejor."}
+- Pregunte hasta cuanto podria estirar el presupuesto o que ajuste busca.
+- NUNCA inventes productos ni precios distintos a los que te di. Solo texto, sin listas.`;
+      let msg;
+      try {
+        const r = await anthropic.messages.create({
+          model: "claude-haiku-4-5-20251001",
+          max_tokens: 180,
+          system: noStockPrompt,
+          messages: [{ role: "user", content: query }],
+        });
+        msg = (r.content[0]?.text || "").trim();
+      } catch {
+        msg = ""; // si Claude falla, abajo hay respaldo
+      }
+      // Respaldo minimo solo si Claude no devolvio nada (no debe pasar seguido).
+      if (!msg) {
+        msg = budget
+          ? `Oye, justo ahora no tengo laptops en ese presupuesto${cheapestTxt ? `; las opciones parten alrededor de ${cheapestTxt}` : ""}. ¿Hasta cuánto podrías estirar?`
+          : "Oye, cuéntame un poco más (uso y presupuesto) y te busco la mejor opción.";
+      }
+      if (session) {
+        session.history.push({ role: "user", content: query });
+        session.history.push({ role: "assistant", content: msg });
+      }
+      return res.json({ message: msg, items: [] });
+    }
+
+    const budgetWords = ["barata","barato","económico","economico","economica","económica","cheap","precio bajo","más barata","mas barata","menor precio","más económica","mas economica","low cost","accesible","pesos","plata","lucas","luca","palos","palo"];
+    const powerWords  = ["potente","poderosa","poderoso","mejor","top","gama alta","más potente","mas potente","la mejor","lo mejor","high end","bacan","bacán"];
     const isBudget = budgetWords.some(w => q.includes(w));
-    const isPower = powerWords.some(w => q.includes(w));
+    const isPower  = powerWords.some(w => q.includes(w));
 
-    // ── Detect specific specs in query ───────────────────────────────
     const processorMatch = q.match(/\bi[3579]\b/) || q.match(/ryzen\s*[3579]/) || q.match(/core\s*ultra/);
-    const gpuMatch = q.match(/rtx\s*\d{4}/) || q.match(/gtx\s*\d{4}/);
+    const gpuMatch       = q.match(/rtx\s*\d{4}/) || q.match(/gtx\s*\d{4}/);
 
-    // ── Filter relevant by specific specs if mentioned ───────────────
     let specFiltered = relevant;
     if (processorMatch) {
       const proc = processorMatch[0].toLowerCase().replace(/\s+/g, "");
-      const withSpec = relevant.filter(p => {
-        const text = `${p.title} ${p.description} ${p.model} ${p.link}`.toLowerCase().replace(/\s+/g, "");
-        return text.includes(proc);
-      });
-      if (withSpec.length > 0) specFiltered = withSpec;
+      const w = relevant.filter(p => `${p.title} ${p.description} ${p.model} ${p.link}`.toLowerCase().replace(/\s+/g, "").includes(proc));
+      if (w.length > 0) specFiltered = w;
     }
     if (gpuMatch) {
       const gpu = gpuMatch[0].toLowerCase().replace(/\s+/g, "");
-      const withGpu = specFiltered.filter(p => {
-        const text = `${p.title} ${p.description} ${p.model} ${p.link}`.toLowerCase().replace(/\s+/g, "");
-        return text.includes(gpu);
-      });
-      if (withGpu.length > 0) specFiltered = withGpu;
+      const w = specFiltered.filter(p => `${p.title} ${p.description} ${p.model} ${p.link}`.toLowerCase().replace(/\s+/g, "").includes(gpu));
+      if (w.length > 0) specFiltered = w;
     }
 
-    // ── Determine products to send based on intent ───────────────────
-    let productsToSend, exactCount, messageType;
-
+    let productsToSend, messageType;
     if (isBudget && specFiltered.length > 0 && specFiltered.length < relevant.length) {
-      productsToSend = [...specFiltered]
-        .sort((a, b) => (parseFloat(a.price) || 999999) - (parseFloat(b.price) || 999999))
-        .slice(0, 3);
-      exactCount = productsToSend.length;
+      productsToSend = [...specFiltered].sort((a, b) => (parseFloat(a.price)||999999) - (parseFloat(b.price)||999999)).slice(0, 3);
       messageType = "budget_spec";
-
     } else if (isBudget) {
-      productsToSend = [...relevant]
-        .sort((a, b) => (parseFloat(a.price) || 999999) - (parseFloat(b.price) || 999999))
-        .slice(0, 3);
-      exactCount = productsToSend.length;
+      productsToSend = [...relevant].sort((a, b) => (parseFloat(a.price)||999999) - (parseFloat(b.price)||999999)).slice(0, 3);
       messageType = "budget";
-
     } else if (isPower) {
-      productsToSend = [...specFiltered]
-        .sort((a, b) => (parseFloat(b.price) || 0) - (parseFloat(a.price) || 0))
-        .slice(0, 3);
-      exactCount = productsToSend.length;
+      productsToSend = [...specFiltered].sort((a, b) => (parseFloat(b.price)||0) - (parseFloat(a.price)||0)).slice(0, 3);
       messageType = "power";
-
     } else if (specFiltered.length > 0 && specFiltered.length < relevant.length) {
       productsToSend = specFiltered.slice(0, 3);
-      exactCount = productsToSend.length;
       messageType = "spec";
-
     } else {
       const exactMatches = exactMatchProducts(query, relevant);
       if (exactMatches.length > 0) {
         productsToSend = exactMatches.slice(0, 3);
-        exactCount = productsToSend.length;
         messageType = "exact";
       } else {
         productsToSend = relevant.slice(0, 3);
-        exactCount = 0;
         messageType = "noMatch";
       }
     }
 
-    // ── Build user message based on intent ───────────────────────────
-    let userMessage;
-    if (messageType === "budget_spec") {
-      userMessage = `El cliente busca: "${query}". Encontramos ${productsToSend.length} laptops económicas con esa especificación, ordenadas de menor a mayor precio. Muéstralas TODAS. Para el campo MESSAGE escribe una frase corta y natural en español chileno que mencione que son las opciones más accesibles para lo que el cliente necesita. Adáptalo al contexto real del cliente.`;
-    } else if (messageType === "budget") {
-      userMessage = `El cliente busca: "${query}". Encontramos ${productsToSend.length} laptops económicas ordenadas de menor a mayor precio. Muéstralas TODAS. Para el campo MESSAGE escribe una frase corta y natural en español chileno reconociendo lo que el cliente busca. Adáptalo al contexto real.`;
-    } else if (messageType === "power") {
-      userMessage = `El cliente busca: "${query}". Encontramos ${productsToSend.length} laptops potentes ordenadas de mayor a menor precio. Muéstralas TODAS. Para el campo MESSAGE escribe una frase corta y natural en español chileno que mencione para qué sirven estas laptops. Adáptalo al contexto real del cliente.`;
-    } else if (messageType === "spec") {
-      userMessage = `El cliente busca: "${query}". Encontramos ${productsToSend.length} laptops que coinciden con esa especificación. Muestra SOLO esas ${productsToSend.length}. NO agregues más. Para el campo MESSAGE escribe una frase corta y natural en español chileno. Adáptalo al contexto real.`;
-    } else if (messageType === "exact") {
-      userMessage = `El cliente busca: "${query}". Hay ${exactCount} productos que coinciden exactamente. Muestra SOLO esos ${exactCount}. NO agregues más aunque sean menos de 3. Para el campo MESSAGE escribe una frase corta y natural en español chileno celebrando que encontramos lo que buscaba.`;
-    } else {
-      userMessage = `El cliente busca: "${query}". No hay productos exactos en el catálogo pero tenemos ${productsToSend.length} alternativas similares. Muéstralas TODAS.
+    // ── User message by intent ───────────────────────────────────────
+    const intentMap = {
+      budget_spec: `El cliente busca: "${query}". Encontramos ${productsToSend.length} laptops economicas con esa especificacion, de menor a mayor precio. MESSAGE: frase corta en español chileno.`,
+      budget:      `El cliente busca: "${query}". Encontramos ${productsToSend.length} laptops economicas de menor a mayor precio. MESSAGE: frase corta en español chileno.`,
+      power:       `El cliente busca: "${query}". Encontramos ${productsToSend.length} laptops potentes de mayor a menor precio. MESSAGE: frase corta en español chileno.`,
+      spec:        `El cliente busca: "${query}". Encontramos ${productsToSend.length} laptops con esa especificacion. MESSAGE: frase corta en español chileno.`,
+      exact:       `El cliente busca: "${query}". Hay ${productsToSend.length} productos que coinciden exactamente. MESSAGE: frase corta celebrando que encontramos lo que buscaba.`,
+      noMatch:     `El cliente busca: "${query}". No hay productos exactos pero tenemos ${productsToSend.length} alternativas similares. MESSAGE: frase amigable explicando las alternativas. NUNCA copies el texto del cliente en TITLE.`,
+    };
+    const userMessage = intentMap[messageType];
 
-REGLAS IMPORTANTES:
-- El campo TITLE debe ser el nombre real del producto alternativo, NUNCA el texto del cliente
-- El campo MESSAGE debe ser una frase natural y amigable en español chileno explicando que ese modelo/spec no está disponible pero que tienes estas alternativas similares. NUNCA copies literalmente lo que escribió el cliente`;
+    // Si el cliente queria GAMING pero lo que cabe en su presupuesto NO es gaming,
+    // NO mostramos tarjetas de no-gaming (seria contradictorio). En vez de eso,
+    // Claude redacta un mensaje honesto y le preguntamos cuanto puede estirar.
+    const wantedGaming = /(gaming|gamer|jugar|juego|fortnite|valorant|lol)/i.test(searchQuery);
+    const sentGaming = productsToSend.some(p => /gaming|tuf|rog|strix|rtx|gtx/i.test(`${p.title} ${p.description}`));
+    if (wantedGaming && !sentGaming) {
+      const budget = extractBudget(q) || extractBudget(searchQuery.toLowerCase());
+      // precio de la gaming mas barata del catalogo, para orientar al cliente
+      const cheapestGaming = catalog
+        .filter(p => /gaming|tuf|rog|strix|rtx|gtx/i.test(`${p.title} ${p.description} ${p.category}`))
+        .reduce((min, p) => { const pr = parseFloat(p.price) || 0; return (pr > 0 && pr < min) ? pr : min; }, Infinity);
+      const gTxt = cheapestGaming !== Infinity ? formatCLP(cheapestGaming) : "";
+      const gPrompt =
+        `Eres AnastasIA, asesora de laptops ASUS Chile, natural y amigable con toques chilenos sin exagerar.
+El cliente quiere una laptop para GAMING${budget ? ` con presupuesto de ${formatCLP(budget)}` : ""}.
+SITUACION: en ese rango de precio NO hay laptops gaming en la tienda. Las que caben en ese presupuesto son para trabajo/estudio, NO para juegos exigentes.${gTxt ? ` La laptop gaming mas economica disponible cuesta ${gTxt}.` : ""}
+Escribe un mensaje corto (2-3 frases) que:
+- Reconozca con honestidad que en ese presupuesto no hay laptops gaming de verdad.
+- ${gTxt ? `Mencione que las gaming arrancan alrededor de ${gTxt}.` : "Explique que las gaming cuestan un poco mas."}
+- Pregunte hasta cuanto podria estirar el presupuesto para conseguirle una gaming real.
+- NO ofrezcas laptops de trabajo como si sirvieran para gaming. Solo texto, sin listas, sin inventar precios.`;
+      let gMsg;
+      try {
+        const gr = await anthropic.messages.create({
+          model: "claude-haiku-4-5-20251001",
+          max_tokens: 180,
+          system: gPrompt,
+          messages: [{ role: "user", content: query }],
+        });
+        gMsg = (gr.content[0]?.text || "").trim();
+      } catch { gMsg = ""; }
+      if (!gMsg) {
+        gMsg = `Oye, en ese presupuesto no tengo laptops gaming de verdad${gTxt ? `; las gaming parten alrededor de ${gTxt}` : ""}. ¿Hasta cuánto podrías estirar para conseguir una que rinda en juegos?`;
+      }
+      if (session) {
+        session.history.push({ role: "user", content: query });
+        session.history.push({ role: "assistant", content: gMsg });
+      }
+      console.log(`🎮 Gaming sin opciones en presupuesto → mensaje honesto, sin tarjetas`);
+      return res.json({ message: gMsg, items: [] });
     }
+    // Si el perfil acumulo varios usos (ej. universidad + gaming), se lo decimos
+    // a Claude para que el "ideal_para" refleje TODOS, no solo el ultimo pedido.
+    const useLabel = { gaming: "gaming", universidad: "universidad", trabajo: "trabajo", diseño: "diseño", portatil: "portabilidad" };
+    const profileUses = (session?.profile?.uses || []).map(u => useLabel[u] || u);
+    const usesNote = profileUses.length > 1
+      ? ` El cliente usara la laptop para varias cosas: ${profileUses.join(" y ")}. En "ideal_para" de cada producto refleja los usos que apliquen (ej: "Universidad y gaming"), no solo uno, siempre que el producto sirva para ellos.`
+      : "";
+    const userMessageFinal = userMessage + usesNote;
 
-    // ── Build product list with promo hint ───────────────────────────
+    // Contexto de memoria: si ya mostramos laptops antes, decirle a Claude
+    // cuales fueron para que el "message" no repita ni ignore lo anterior
+    // (ej. el cliente pidio "mas barata" -> Claude sabe respecto a que).
+    const priorContext = (session && session.shownProducts.length)
+      ? `\nCONTEXTO: antes en esta conversacion ya le mostramos estas laptops: ${session.shownProducts.map(p => p.title).join("; ")}. Las de ahora son una nueva seleccion segun lo que acaba de pedir; en el "message" no las repitas como si fueran nuevas marcas, conecta de forma natural con lo que pidio.`
+      : "";
+
+    // ── Build product list — only what Claude needs ──────────────────
     const productList = productsToSend.map((p, i) => {
       const promo = calcPromo(p.regularPrice, p.price);
       const promoHint = promo ? `PROMO_CALCULADO: ${promo}` : `PROMO_CALCULADO: none`;
-      const safeDesc = p.description.replace(/"/g, "'");
-      const sku = p.partNumber || p.model;
-      return `${i+1}. ${p.title} | Precio oferta: ${p.price} | Precio regular: ${p.regularPrice} | Modelo: ${p.model} | URL: ${addUTM(p.link, sku)} | Imagen: ${p.image} | Descripcion: ${safeDesc} | ${promoHint}`;
+      return `${i+1}. ${p.title} | Precio oferta: ${p.price} | Precio regular: ${p.regularPrice} | Modelo: ${p.model} | Descripcion: ${p.description.replace(/"/g, "'")} | ${promoHint}`;
     }).join("\n");
 
+    // ── Claude call — JSON enriquecido por item ──────────────────────
     const tClaude = Date.now();
     const response = await anthropic.messages.create({
       model: "claude-haiku-4-5-20251001",
-      max_tokens: 1500,
+      max_tokens: 1100,
       system: `Eres AnastasIA, experta en laptops ASUS para clientes chilenos.
-El cliente puede escribir con errores ortográficos o español informal. Entiende chilenismos pero responde siempre de forma amigable y profesional.
-TONO: Amigable y profesional con calidez chilena. Puedes usar expresiones como "bacán" o "una opción increíble" ocasionalmente, pero evita jerga muy informal. Escribe como un vendedor experto de ASUS Chile que es simpático y cercano.
-Ejemplos de lo que el cliente puede escribir:
-- "algo pa jugar po" = gaming
-- "lapto barata" = presupuesto ajustado
-- "pa la u" = uso universitario
-- "pa la pega" = uso laboral
-- "pa diseño" = necesita buena GPU y pantalla
-- "la mas bacán" = top de gama
-- "liviana" = portabilidad
-- "cuántas lucas vale" = cuánto cuesta
-- "laptop i9" = alto rendimiento
-- "32gb ram" = ofrecer el de mayor RAM disponible
+Entiende chilenismos (bacán, cachai, la pega, la u, lucas, palos, etc.) pero responde amigable y profesional.
 
-CATÁLOGO DISPONIBLE:
+CATALOGO (numerado por posicion):
 ${productList}
 
-INSTRUCCIONES ESTRICTAS:
-- Analiza la intención real del usuario aunque tenga errores o use chilenismos
-- Si el usuario pide algo económico, prioriza los de menor precio
-- Si pide gaming, prioriza los que tengan RTX o GPU dedicada
-- Si pide para la u o la pega, prioriza los livianos y versátiles
-- El campo TITLE siempre debe ser el nombre real del producto del catálogo
-- NUNCA menciones marcas competidoras como Lenovo, HP, Dell, Acer, Samsung, Apple, MSI o cualquier otra marca que no sea ASUS en ningún campo del JSON ni en el mensaje
-- El campo MESSAGE debe ser siempre una frase natural y amigable, nunca una copia del texto del cliente
-- Para SPECS extrae SOLO estos datos del campo Descripcion: procesador | RAM | GPU | almacenamiento | tamaño pantalla. IGNORA todo lo demas como Sistema Operativo, cache, etc. NUNCA uses comillas dobles. Ejemplo: Ryzen 5 7535HS | 16GB DDR5 | RTX 3050 | 512GB SSD | 15pulg — maximo 90 caracteres
-- Los precios son en pesos chilenos CLP con formato $1.299.000
-- Para PROMO: si PROMO_CALCULADO no es none, usalo como base pero agregale al final un tagline corto de maximo 20 caracteres con emoji segun el tipo de laptop. Ejemplos: $4.899.990 → $3.599.990 ⚡ ¡Oferta! · 🔥 Top gaming o $1.219.990 → $879.990 ⚡ ¡Oferta! · ✨ Ideal uni. Si es none escribe el precio oferta en formato CLP seguido de punto medio y emoji y una frase corta de maximo 40 caracteres con beneficio claro. Ejemplos: $1.299.000 · ✨ Ideal para diseño versatil o $899.990 · 🎯 Perfecta para la universidad
-- IMPORTANTE: Los valores de todos los campos de texto NO deben contener comillas dobles internas.
-- Devuelve SOLO un JSON valido sin texto adicional sin markdown:
-{"message":"texto del mensaje general","items":[{"TITLE":"nombre completo","TITLE_DISPLAY":"nombre corto max 40 chars","PRECIO_REGULAR_FORMAT":"$1.299.000","PRECIO_OFERTA_FORMAT":"$1.099.000","PRECIO_REGULAR":1299000,"PRECIO_OFERTA":1099000,"URL":"url exacta del producto","IMAGEN":"url exacta de la imagen","SPECS":"procesador RAM GPU almacenamiento maximo 90 caracteres","PROMO":"descuento o tagline maximo 50 caracteres"}]}`,
-      messages: [{ role: "user", content: userMessage }],
+REGLAS (sin comillas dobles en ningun valor de texto):
+- "message": frase corta y natural en español chileno. NUNCA copies el texto del cliente. NUNCA menciones otras marcas.
+  - HONESTIDAD: si el cliente pidio algo especifico (ej: procesador i9, 32GB de RAM, una GPU puntual, una pulgada exacta) y NINGUN producto del catalogo lo cumple, NO finjas que si. Reconoce con naturalidad que ahora mismo no tienes exactamente eso en la tienda y ofrece la alternativa mas cercana explicando por que sirve. Ej: "Oye, justo ahora no tengo laptops con i9 en la tienda, pero estas con Ryzen 7 y RTX rinden igual de bien para gaming". Sé honesto pero positivo, nunca inventes que un producto tiene un spec que no tiene.
+- "title_display": nombre corto del producto, max 40 caracteres.
+- Specs clave extraidas de la descripcion (cada una corta, sin la etiqueta):
+  - "cpu": procesador. Ej: Ryzen 7 260  o  Core Ultra 7 258V
+  - "ram": memoria. Ej: 16GB DDR5  o  32GB LPDDR5X
+  - "ssd": almacenamiento. Ej: 1TB SSD  o  512GB SSD
+  - "pantalla": tamaño/tipo. Ej: 16 FHD  o  14 OLED  o  15.6pulg
+  - "gpu": tarjeta grafica. Ej: RTX 5050  o  RTX 4060  o  Radeon integrada
+  - "teclado_espanol": si la descripcion menciona teclado en español/latinoamericano pon "Sí", si menciona retroiluminado puedes poner "Retroiluminado ES". Si NO se menciona, pon "".
+  - "en_caja": que incluye la caja si la descripcion lo dice (ej: Cargador y mouse). Si NO se menciona, pon "".
+  - REGLA CRITICA: si un dato NO aparece en la descripcion, pon "" (vacio). NUNCA inventes specs.
+- "ideal_para": para que tipo de uso brilla, 2-4 palabras. Ej: Gaming y AutoCAD  o  Universidad  o  Diseño y edicion  o  Trabajo diario.
+- "tagline": frase corta y vendedora SIN emojis, max 28 chars. Conecta con lo que pidio el cliente. Ej: En oferta  o  Brutal para gaming  o  Perfecta para la u  o  Potencia pura.
+- Devuelve SOLO JSON valido sin markdown, en el ORDEN exacto del catalogo:
+{"message":"texto","items":[{"title_display":"...","cpu":"...","ram":"...","ssd":"...","pantalla":"...","gpu":"...","teclado_espanol":"...","en_caja":"...","ideal_para":"...","tagline":"..."}]}`,
+      messages: [{ role: "user", content: userMessageFinal + priorContext }],
     });
     console.log(`⏱️ Claude API: ${Date.now() - tClaude}ms`);
 
-    // ── Parse JSON con repair fallback ────────────────────────────────
+    // ── Parse JSON ───────────────────────────────────────────────────
     const raw = response.content[0].text.trim().replace(/```json|```/g, "").trim();
     let result;
     try {
       result = JSON.parse(raw);
     } catch (parseErr) {
-      // Si el JSON viene truncado, intentar rescatar items completos
-      const lastValidItem = raw.lastIndexOf("},");
-      if (lastValidItem > 0) {
-        const repaired = raw.slice(0, lastValidItem + 1) + "]}";
-        try {
-          result = JSON.parse(repaired);
-          console.log(`⚠️ JSON reparado: ${result.items?.length || 0} productos rescatados`);
-        } catch {
-          throw parseErr;
-        }
-      } else {
-        throw parseErr;
-      }
+      const lastValid = raw.lastIndexOf("},");
+      if (lastValid > 0) {
+        try { result = JSON.parse(raw.slice(0, lastValid + 1) + "]}"); console.log(`⚠️ JSON reparado`); }
+        catch { throw parseErr; }
+      } else { throw parseErr; }
     }
-    console.log(`✅ AnastasIA CL devuelve ${result.items?.length || 0} productos · Total: ${Date.now() - tStart}ms`);
-    return res.json(result);
+
+    // ── Merge Claude output with catalog data ────────────────────────
+    const claudeItems = Array.isArray(result.items) ? result.items : [];
+
+    // Si Claude no devolvio exactamente un item por producto, su orden NO es
+    // confiable: pegar title/specs por indice mezclaria un producto con otro
+    // (ej. titulo de laptop sobre URL de un case). En ese caso ignoramos el
+    // texto de Claude y usamos los datos del propio producto del catalogo.
+    const aligned = claudeItems.length === productsToSend.length;
+    if (!aligned) console.log(`⚠️ Claude devolvio ${claudeItems.length} items vs ${productsToSend.length} productos — usando datos del catalogo`);
+
+    const mergedItems = productsToSend.map((p, i) => {
+      const ci = aligned ? (claudeItems[i] || {}) : {};
+      const sku = p.partNumber || p.model;
+      const regularNum = parseFloat(p.regularPrice) || parseFloat(p.price) || 0;
+      const offerNum   = parseFloat(p.price) || 0;
+      const clean = (s) => (s ? String(s).replace(/"/g, "'").trim() : "");
+      // SPECS unificado (compat con cualquier render viejo) a partir de los campos.
+      const specsJoined = [ci.cpu, ci.ram, ci.ssd, ci.pantalla].filter(Boolean).join(" | ")
+        || p.description.slice(0, 90);
+      return {
+        TITLE:                p.title,
+        TITLE_DISPLAY:        (ci.title_display || p.title).slice(0, 50),
+        PRECIO_REGULAR_FORMAT: formatCLP(regularNum),
+        PRECIO_OFERTA_FORMAT:  formatCLP(offerNum),
+        PRECIO_REGULAR:        regularNum,
+        PRECIO_OFERTA:         offerNum,
+        URL:                  addUTM(p.link, sku),
+        IMAGEN:               p.image,
+        SPECS:                clean(specsJoined),
+        CPU:                  clean(ci.cpu),
+        RAM:                  clean(ci.ram),
+        SSD:                  clean(ci.ssd),
+        PANTALLA:             clean(ci.pantalla),
+        GPU:                  clean(ci.gpu),
+        TECLADO_ES:           clean(ci.teclado_espanol),
+        EN_CAJA:              clean(ci.en_caja),
+        IDEAL_PARA:           clean(ci.ideal_para),
+        TAGLINE:              clean(ci.tagline) || calcPromo(p.regularPrice, p.price) || "",
+        PROMO:                clean(ci.tagline) || calcPromo(p.regularPrice, p.price) || formatCLP(offerNum),
+      };
+    });
+
+    console.log(`✅ AnastasIA CL devuelve ${mergedItems.length} productos · Total: ${Date.now() - tStart}ms`);
+
+    // ── Guardar en memoria: productos mostrados + turno de conversacion ──
+    if (session) {
+      session.shownProducts = mergedItems.map(it => ({
+        title: it.TITLE, model: (productsToSend.find(p => p.title === it.TITLE)?.model) || "",
+        specs: [it.CPU, it.RAM, it.SSD, it.PANTALLA, it.GPU].filter(Boolean).join(" | ") || it.SPECS,
+      }));
+      session.history.push({ role: "user", content: query });
+      session.history.push({ role: "assistant", content: (result.message || "") + " [mostre: " + mergedItems.map(i => i.TITLE).join(", ") + "]" });
+      if (session.history.length > MAGENTO_HISTORY_TURNS * 2) session.history = session.history.slice(-MAGENTO_HISTORY_TURNS * 2);
+    }
+
+    return res.json({ message: result.message || "", items: mergedItems });
 
   } catch (err) {
     console.error("❌ Error en AnastasIA CL:", err.message);
     const fallback = searchProducts(query).slice(0, 3).map(p => {
-      const promo = calcPromo(p.regularPrice, p.price);
       const sku = p.partNumber || p.model;
       return {
-        TITLE: p.title,
-        TITLE_DISPLAY: p.title.slice(0, 50),
+        TITLE: p.title, TITLE_DISPLAY: p.title.slice(0, 50),
         PRECIO_REGULAR_FORMAT: formatCLP(parseFloat(p.regularPrice || p.price) || 0),
-        PRECIO_OFERTA_FORMAT: formatCLP(parseFloat(p.price) || 0),
+        PRECIO_OFERTA_FORMAT:  formatCLP(parseFloat(p.price) || 0),
         PRECIO_REGULAR: parseFloat(p.regularPrice || p.price) || 0,
-        PRECIO_OFERTA: parseFloat(p.price) || 0,
-        URL: addUTM(p.link, sku),
-        IMAGEN: p.image,
+        PRECIO_OFERTA:  parseFloat(p.price) || 0,
+        URL: addUTM(p.link, sku), IMAGEN: p.image,
         SPECS: p.description ? p.description.replace(/"/g, "'").slice(0, 90) : "",
-        PROMO: promo || "Visita nuestra tienda ASUS Chile",
+        PROMO: calcPromo(p.regularPrice, p.price) || "Visita nuestra tienda ASUS Chile",
       };
     });
-    return res.json({ items: fallback });
+    // error_flag avisa al frontend que esto fue un fallback (para trackear).
+    return res.json({ items: fallback, error_flag: true, error_msg: String(err.message || "").slice(0, 200) });
   }
 });
 
 await refreshCatalog();
 setInterval(refreshCatalog, CONFIG.FEED_REFRESH_MS);
 
+// ── Keep-alive ping ──────────────────────────────────────────────────
+setInterval(async () => {
+  try {
+    await fetch(`http://localhost:${CONFIG.PORT}/health`);
+    console.log("Keep-alive CO");
+  } catch (e) {}
+}, 5 * 60 * 1000);
+
 app.listen(CONFIG.PORT, () => {
-  console.log(`🚀 AnastasIA CL corriendo en puerto ${CONFIG.PORT}`);
+  console.log(`AnastasIA CL corriendo en puerto ${CONFIG.PORT}`);
 });

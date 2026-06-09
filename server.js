@@ -279,7 +279,7 @@ async function refreshCatalog() {
 
       // Piso de precio: ninguna laptop ASUS en CLP baja de ~$200.000.
       // Accesorios (cases, mouse) estan muy por debajo -> se descartan.
-      if (offer > 0 && offer < 1000000) return false;
+      if (offer > 0 && offer < 200000) return false;
 
       return true;
     });

@@ -226,7 +226,7 @@ function addUTM(url, partNumber) {
 
 async function refreshCatalog() {
   try {
-    console.log("Actualizando catálogo CO...");
+    console.log("Actualizando catálogo CL...");
     const res = await fetch(CONFIG.FEED_URL);
     const xml = await res.text();
     const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: "@_", parseTagValue: true });
@@ -283,9 +283,9 @@ async function refreshCatalog() {
 
       return true;
     });
-    console.log(`✅ Catálogo CO cargado: ${catalog.length} productos activos`);
+    console.log(`✅ Catálogo CL cargado: ${catalog.length} productos activos`);
   } catch (err) {
-    console.error("❌ Error actualizando catálogo CO:", err.message);
+    console.error("❌ Error actualizando catálogo CL:", err.message);
   }
 }
 
@@ -435,7 +435,8 @@ async function askClaude(conversationId, userMessage) {
   if (!conversations[conversationId]) conversations[conversationId] = [];
   const history = conversations[conversationId];
   const productList = relevant.map(p => `• ${p.title} — ${p.price}${p.link ? ` | URL: ${p.link}` : ""}`).join("\n");
-  const systemPrompt = `Eres un asistente de ventas amigable y experto de esta tienda online ASUS Chile.
+  const systemPrompt = `Eres un asistente de ventas experto de esta tienda online ASUS Chile.
+TONO: profesional y cercano, en español claro. Entiendes la jerga chilena si el cliente la usa, pero TU NUNCA respondes con jerga ni modismos (nada de "bacán", "cachai", "weón", "po"). Trata al cliente de "tú".
 PRODUCTOS DISPONIBLES:
 ${productList}
 INSTRUCCIONES:
@@ -680,7 +681,7 @@ DESCRIPCION: ${target.description.replace(/"/g, "'")}
 Modelo: ${target.model} | Precio: ${target.price}
 
 Devuelve SOLO JSON valido sin markdown:
-{"intro":"1 frase corta presentando la laptop","specs":[{"label":"Procesador","value":"..."},{"label":"Memoria RAM","value":"..."},{"label":"Almacenamiento","value":"..."},{"label":"Pantalla","value":"..."},{"label":"Tarjeta grafica","value":"..."},{"label":"Sistema operativo","value":"..."}],"porque":"parrafo de 2-3 frases en español chileno explicando por que es buena opcion y para que usos brilla (gaming, AutoCAD, universidad, diseño). Natural y vendedor sin exagerar."}
+{"intro":"1 frase corta presentando la laptop","specs":[{"label":"Procesador","value":"..."},{"label":"Memoria RAM","value":"..."},{"label":"Almacenamiento","value":"..."},{"label":"Pantalla","value":"..."},{"label":"Tarjeta grafica","value":"..."},{"label":"Sistema operativo","value":"..."}],"porque":"parrafo de 2-3 frases en español neutro y profesional (sin jerga) explicando por que es buena opcion y para que usos brilla (gaming, AutoCAD, universidad, diseño). Natural y vendedor sin exagerar."}
 REGLAS: solo specs que aparezcan en la descripcion; si un spec no esta, omite ese objeto del array (no lo inventes). Incluye RAM ampliable si se menciona. Sin comillas dobles dentro de los valores.`,
           messages: [{ role: "user", content: query }],
         });
@@ -782,10 +783,10 @@ REGLAS: solo specs que aparezcan en la descripcion; si un spec no esta, omite es
       const followResp = await anthropic.messages.create({
         model: "claude-haiku-4-5-20251001",
         max_tokens: 250,
-        system: `Eres AnastasIA, asesora de laptops ASUS Chile. Entiendes chilenismos pero respondes amigable y profesional.
+        system: `Eres AnastasIA, asesora de laptops ASUS Chile. Entiendes la jerga chilena si el cliente la usa, pero TU respondes en español claro y profesional, sin jerga ni modismos.
 El cliente ya vio recomendaciones de laptops y ahora hace una pregunta de seguimiento (envío, garantía, pago, o cuál elegir).${shownList}
 REGLAS:
-- Responde SOLO la pregunta, en 1-2 frases cortas, español chileno natural.
+- Responde SOLO la pregunta, en 1-2 frases cortas, español neutro y profesional, sin jerga.
 - NO listes tarjetas de producto nuevas. Si el cliente pregunta cual le conviene o elige una de las que vio, puedes mencionarla POR NOMBRE (de la lista de arriba) y dar un criterio breve, pero sin reabrir busqueda.
 - Si pregunta por envíos: en Chile la entrega suele ser 2-3 días hábiles según ciudad.
 - Si pregunta por garantía: las laptops ASUS tienen garantía oficial; los detalles los confirma el asesor.
@@ -851,7 +852,7 @@ REGLAS:
       }, Infinity);
       const cheapestTxt = cheapest !== Infinity ? formatCLP(cheapest) : "";
       const noStockPrompt =
-        `Eres AnastasIA, asesora de laptops ASUS Chile. Hablas natural y amigable, con toques chilenos sin exagerar.
+        `Eres AnastasIA, asesora de laptops ASUS Chile. Tono profesional y cercano, en español claro sin jerga ni modismos.
 El cliente pidio: "${query}".
 SITUACION: en la tienda NO hay ninguna laptop que encaje con ese pedido${budget ? ` (su presupuesto es ${formatCLP(budget)})` : ""}.${cheapestTxt ? ` La laptop mas economica disponible cuesta ${cheapestTxt}.` : ""}
 Escribe un mensaje corto (2-3 frases) que:
@@ -930,10 +931,10 @@ Escribe un mensaje corto (2-3 frases) que:
 
     // ── User message by intent ───────────────────────────────────────
     const intentMap = {
-      budget_spec: `El cliente busca: "${query}". Encontramos ${productsToSend.length} laptops economicas con esa especificacion, de menor a mayor precio. MESSAGE: frase corta en español chileno.`,
-      budget:      `El cliente busca: "${query}". Encontramos ${productsToSend.length} laptops economicas de menor a mayor precio. MESSAGE: frase corta en español chileno.`,
-      power:       `El cliente busca: "${query}". Encontramos ${productsToSend.length} laptops potentes de mayor a menor precio. MESSAGE: frase corta en español chileno.`,
-      spec:        `El cliente busca: "${query}". Encontramos ${productsToSend.length} laptops con esa especificacion. MESSAGE: frase corta en español chileno.`,
+      budget_spec: `El cliente busca: "${query}". Encontramos ${productsToSend.length} laptops economicas con esa especificacion, de menor a mayor precio. MESSAGE: frase corta y profesional en español neutro, sin jerga.`,
+      budget:      `El cliente busca: "${query}". Encontramos ${productsToSend.length} laptops economicas de menor a mayor precio. MESSAGE: frase corta y profesional en español neutro, sin jerga.`,
+      power:       `El cliente busca: "${query}". Encontramos ${productsToSend.length} laptops potentes de mayor a menor precio. MESSAGE: frase corta y profesional en español neutro, sin jerga.`,
+      spec:        `El cliente busca: "${query}". Encontramos ${productsToSend.length} laptops con esa especificacion. MESSAGE: frase corta y profesional en español neutro, sin jerga.`,
       exact:       `El cliente busca: "${query}". Hay ${productsToSend.length} productos que coinciden exactamente. MESSAGE: frase corta celebrando que encontramos lo que buscaba.`,
       noMatch:     `El cliente busca: "${query}". No hay productos exactos pero tenemos ${productsToSend.length} alternativas similares. MESSAGE: frase amigable explicando las alternativas. NUNCA copies el texto del cliente en TITLE.`,
     };
@@ -952,7 +953,7 @@ Escribe un mensaje corto (2-3 frases) que:
         .reduce((min, p) => { const pr = parseFloat(p.price) || 0; return (pr > 0 && pr < min) ? pr : min; }, Infinity);
       const gTxt = cheapestGaming !== Infinity ? formatCLP(cheapestGaming) : "";
       const gPrompt =
-        `Eres AnastasIA, asesora de laptops ASUS Chile, natural y amigable con toques chilenos sin exagerar.
+        `Eres AnastasIA, asesora de laptops ASUS Chile, con tono profesional y cercano, en español claro sin jerga ni modismos.
 El cliente quiere una laptop para GAMING${budget ? ` con presupuesto de ${formatCLP(budget)}` : ""}.
 SITUACION: en ese rango de precio NO hay laptops gaming en la tienda. Las que caben en ese presupuesto son para trabajo/estudio, NO para juegos exigentes.${gTxt ? ` La laptop gaming mas economica disponible cuesta ${gTxt}.` : ""}
 Escribe un mensaje corto (2-3 frases) que:
@@ -1008,14 +1009,14 @@ Escribe un mensaje corto (2-3 frases) que:
     const response = await anthropic.messages.create({
       model: "claude-haiku-4-5-20251001",
       max_tokens: 1100,
-      system: `Eres AnastasIA, experta en laptops ASUS para clientes chilenos.
-Entiende chilenismos (bacán, cachai, la pega, la u, lucas, palos, etc.) pero responde amigable y profesional.
+      system: `Eres AnastasIA, asesora experta en laptops ASUS Chile.
+TONO: profesional y cercano, como un buen asesor de tienda. Trata al cliente de "tú". Entiendes la jerga chilena si el cliente la usa (bacán, cachai, la pega, lucas, etc.), pero TU NUNCA respondes con jerga ni modismos: nada de "bacán", "cachai", "weón", "po", "filete". Usa español claro, correcto y amable. Evita ser frío o robótico, pero tambien evita lo demasiado coloquial.
 
 CATALOGO (numerado por posicion):
 ${productList}
 
 REGLAS (sin comillas dobles en ningun valor de texto):
-- "message": frase corta y natural en español chileno. NUNCA copies el texto del cliente. NUNCA menciones otras marcas.
+- "message": frase corta, natural y profesional en español neutro. NUNCA copies el texto del cliente. NUNCA menciones otras marcas. NUNCA uses jerga.
   - HONESTIDAD: si el cliente pidio algo especifico (ej: procesador i9, 32GB de RAM, una GPU puntual, una pulgada exacta) y NINGUN producto del catalogo lo cumple, NO finjas que si. Reconoce con naturalidad que ahora mismo no tienes exactamente eso en la tienda y ofrece la alternativa mas cercana explicando por que sirve. Ej: "Oye, justo ahora no tengo laptops con i9 en la tienda, pero estas con Ryzen 7 y RTX rinden igual de bien para gaming". Sé honesto pero positivo, nunca inventes que un producto tiene un spec que no tiene.
 - "title_display": nombre corto del producto, max 40 caracteres.
 - Specs clave extraidas de la descripcion (cada una corta, sin la etiqueta):
@@ -1132,7 +1133,7 @@ setInterval(refreshCatalog, CONFIG.FEED_REFRESH_MS);
 setInterval(async () => {
   try {
     await fetch(`http://localhost:${CONFIG.PORT}/health`);
-    console.log("Keep-alive CO");
+    console.log("Keep-alive CL");
   } catch (e) {}
 }, 5 * 60 * 1000);
 

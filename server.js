@@ -748,6 +748,12 @@ REGLAS:
         if (session.history.length > MAGENTO_HISTORY_TURNS * 2) session.history = session.history.slice(-MAGENTO_HISTORY_TURNS * 2);
       }
 
+      trackFreshchat({
+        session_id: sessionId || ip,
+        query: query.slice(0, 500),
+        bot_message: followText.slice(0, 500),
+      });
+
       return res.json({ message: followText, items: [] });
     }
 
@@ -806,6 +812,12 @@ Escribe un mensaje corto (2-3 frases) que:
         session.history.push({ role: "user", content: query });
         session.history.push({ role: "assistant", content: msg });
       }
+      trackFreshchat({
+        session_id: sessionId || ip,
+        query: query.slice(0, 500),
+        bot_message: msg.slice(0, 500),
+        products_count: 0,
+      });
       return res.json({ message: msg, items: [] });
     }
 
@@ -898,6 +910,12 @@ Escribe un mensaje corto (2-3 frases) que:
         session.history.push({ role: "assistant", content: gMsg });
       }
       console.log(`🎮 Gaming sin opciones en presupuesto → mensaje honesto, sin tarjetas`);
+      trackFreshchat({
+        session_id: sessionId || ip,
+        query: query.slice(0, 500),
+        bot_message: gMsg.slice(0, 500),
+        products_count: 0,
+      });
       return res.json({ message: gMsg, items: [] });
     }
     const useLabel = { gaming: "gaming", universidad: "universidad", trabajo: "trabajo", diseño: "diseño", portatil: "portabilidad" };
@@ -998,11 +1016,19 @@ REGLAS (sin comillas dobles en ningun valor de texto):
 
     console.log(`✅ AnastasIA CL devuelve ${mergedItems.length} productos · Total: ${Date.now() - tStart}ms`);
 
+    trackFreshchat({
+      session_id: sessionId || ip,
+      query: query.slice(0, 500),
+      bot_message: (result.message || "").slice(0, 500),
+      products_shown: mergedItems.map(it => it.TITLE).join(" | ").slice(0, 500),
+      products_count: mergedItems.length,
+    });
+
     if (session) {
       session.shownProducts = mergedItems.map(it => ({
         title: it.TITLE, model: (productsToSend.find(p => p.title === it.TITLE)?.model) || "",
         specs: [it.CPU, it.RAM, it.SSD, it.PANTALLA, it.GPU].filter(Boolean).join(" | ") || it.SPECS,
-      }));
+      }));https://github.com/asusmarketingtool/anastasi-cl/blob/main/server.js
       session.history.push({ role: "user", content: query });
       session.history.push({ role: "assistant", content: (result.message || "") + " [mostre: " + mergedItems.map(i => i.TITLE).join(", ") + "]" });
       if (session.history.length > MAGENTO_HISTORY_TURNS * 2) session.history = session.history.slice(-MAGENTO_HISTORY_TURNS * 2);

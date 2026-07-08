@@ -483,7 +483,10 @@ app.get("/anastasia", async (req, res) => {
   const session = getSession(sessionId);
   // Freshchat (Freshworks) tambien llama GET /anastasia (solo ?q=), SIN session.
   // La pagina Magento siempre manda session= → ese es el discriminador de canal.
-  const trackWeb = (fields) => (sessionId ? trackMagento : trackFreshchat)(fields);
+  // Trafico Magento NO se trackea aqui: la pagina ya lo trackea completa
+  // client-side a la pestaña Events (chips, clicks, CSAT, UTMs, errores).
+  // Trackear aqui tambien lo duplicaria. Solo Freshchat se loguea del server.
+  const trackWeb = (fields) => { if (!sessionId) trackFreshchat(fields); };
   updateProfile(session, query);
   console.log(`AnastasIA CL consulta: "${query}"${sessionId ? ` [${sessionId}]` : ""}`);
   if (!query) return res.json({ items: [] });

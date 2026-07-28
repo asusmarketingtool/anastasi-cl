@@ -109,26 +109,35 @@ const offTopicWords = [
   "chiste","broma","un cuento","cuentame un cuento",
   "noticias","periodico","periódico","novedades del mundo",
 ];
+// Compara ignorando tildes: "se quemo" y "se quemó" son lo mismo para el
+// cliente. Sin esto habia que listar cada variante a mano y siempre faltaba una.
+// Se respeta la ñ, que si cambia el significado.
+function sinTildes(t) {
+  return String(t || "")
+    .replace(/á/g, "a").replace(/é/g, "e").replace(/í/g, "i")
+    .replace(/ó/g, "o").replace(/ú/g, "u").replace(/ü/g, "u")
+    .replace(/Á/g, "a").replace(/É/g, "e").replace(/Í/g, "i")
+    .replace(/Ó/g, "o").replace(/Ú/g, "u");
+}
+
 function hasWord(text, words) {
-  const q = ` ${text.toLowerCase()} `;
+  const q = ` ${sinTildes(String(text).toLowerCase())} `;
   return words.some(w => {
-    w = w.toLowerCase();
+    w = sinTildes(String(w).toLowerCase());
     if (w.includes(" ")) return q.includes(w);
-    return new RegExp(`(^|[^a-záéíóúñ0-9])${w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}([^a-záéíóúñ0-9]|$)`, "i").test(q);
+    return new RegExp(`(^|[^a-zñ0-9])${w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}([^a-zñ0-9]|$)`, "i").test(q);
   });
 }
 
-// ── Filtro de relevancia ─────────────────────────────────────────────
-// La lista de temas prohibidos siempre se queda corta. Esto lo invierte:
-// solo pasa lo que habla de laptops, de la compra, o lo que continua una
-// conversacion que ya tiene una laptop sobre la mesa.
 const RAICES_DOMINIO = [
   // producto y marcas
   "laptop","portatil","portátil","notebook","computador","computadora","equipo","maquina","máquina",
   "asus","rog","tuf","vivobook","zenbook","expertbook","proart","strix","scar","zephyrus","ally",
   "torre","escritorio","desktop","aio","todo en uno","monitor","consola","handheld","chromebook",
   "placa madre","placas madre","motherboard","mobo","fuente de poder","fuente de alimentacion",
-  "psu","componente","gabinete","refrigeraci","disipador",
+  "psu","componente","gabinete","disipador","fuente",
+  // fallas y postventa: deben pasar el filtro para llegar a soporte
+  "quem","romp","prend","enciend","funcion","repar","garant","reclam","devolu","averi","falla",
   // usos
   "gam","jug","jueg","universi","estudi","colegi","liceo","preu","carrera","tesis","clase","trabaj","pega","oficin","negoci",
   "empres","teletrabaj","diseñ","disen","edit","edici","render","program","autocad","photoshop",
@@ -537,17 +546,6 @@ function itemFromCatalog(p, extra = {}) {
 
 // Que es cada producto del feed. El stock lo manda el feed: si no viene,
 // no existe para el bot; si viene, se puede recomendar cuando lo pidan.
-function clasificarTipo(texto) {
-  const t = normTxt(texto).toLowerCase();
-  if (/\bally\b|steam deck|handheld|consola/.test(t)) return "handheld";
-  if (/all in one|all-in-one|todo en uno|\baio\b/.test(t)) return "aio";
-  if (/\btorre\b|\btower\b|desktop|de escritorio|mini pc|\bnuc\b/.test(t)) return "torre";
-  // Chile tiene componentes sueltos en el feed (fuentes de poder, placas madre).
-  // No son equipos completos: no se recomiendan cuando piden una laptop.
-  if (/placa madre|motherboard|fuente de poder|fuente de alimentaci|\bpsu\b|\batx\b|tarjeta grafica pci|tarjeta de video pci/.test(t)) return "componente";
-  return "laptop";
-}
-
 // Que categorias tiene la tienda HOY, segun el feed. Nada quemado en codigo.
 function tiposDisponibles() {
   return [...new Set(catalog.map(p => p.tipo || "laptop"))];
@@ -560,6 +558,17 @@ function fraseOfrecerLoQueHay(excepto) {
   if (nombres.length === 1) return `Lo que sí tengo disponible en la tienda son ${nombres[0]}. ¿Te muestro las opciones?`;
   const ultimo = nombres.pop();
   return `Lo que sí tengo disponible son ${nombres.join(", ")} y ${ultimo}. ¿Cuál te gustaría ver?`;
+}
+
+function clasificarTipo(texto) {
+  const t = normTxt(texto).toLowerCase();
+  if (/\bally\b|steam deck|handheld|consola/.test(t)) return "handheld";
+  if (/all in one|all-in-one|todo en uno|\baio\b/.test(t)) return "aio";
+  // Componentes ANTES que torre: una placa madre suele venir catalogada bajo
+  // "desktop" o "escritorio" en el feed, y quedaba mal clasificada como torre.
+  if (/placas? madre|placas? base|motherboard|mainboard|fuentes? de poder|fuentes? de alimentaci|\bpsu\b|power supply|\batx\b|micro-?atx|\bitx\b|chipset|componente|refrigeraci[oó]n l[ií]quida|disipador|gabinete|graphics card|tarjetas? de video/.test(t)) return "componente";
+  if (/\btorre\b|\btower\b|desktop|de escritorio|mini pc|\bnuc\b/.test(t)) return "torre";
+  return "laptop";
 }
 
 const NOMBRE_TIPO = { laptop: "laptops", torre: "torres o equipos de escritorio", aio: "todo-en-uno", handheld: "consolas portátiles", componente: "componentes de PC" };
@@ -909,7 +918,7 @@ app.get("/anastasia", async (req, res) => {
     }
 
     const serviceWords = [
-      "cargador","cargadora","charger","cable carga","adaptador","fuente de poder",
+      "cargador","cargadora","charger","cable carga","adaptador",
       "dañó","daño","dañada","dañado","quemó","quemada","se quemó","dejó de funcionar",
       "cambiar el ventilador","se rompió","esta rota","esta roto","no me sirve la",
       "bateria hinchada","bateria de repuesto","cambio de bateria",

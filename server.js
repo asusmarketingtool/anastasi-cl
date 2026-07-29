@@ -166,6 +166,7 @@ const RAICES_DOMINIO = [
   "precio","cuest","vale","barat","economic","económic","asequibl","accesibl","presupuest","millon",
   "luca","ofert","descuent","promoc","rebaj","compr","garant","envi","entreg","despach","domicilio",
   "pag","cuota","financiac","stock","disponib","tienda","asesor","factur",
+  "pesos","clp","gamba",
   // intencion
   "recomend","sugier","opcion","opción","muestr","muéstr","tien","teng","hay","necesit","busc","quier",
   "escog","eleg","elij","decid","compar","diferenc","potent","gama","mejor","peor","sirve","aguanta",
@@ -900,7 +901,7 @@ app.get("/anastasia", async (req, res) => {
     // Si ya hay laptops en pantalla, cualquier mensaje corto es parte de la
     // conversacion: "pero son los mas baratos?" no puede quedar bloqueado.
     const cortoConContexto = hayContexto && q.trim().split(/\s+/).length <= 14;
-    if (!esDelDominio(q) && !SALUDOS.test(q.trim()) && !isFollowUp(q) && !cortoConContexto) {
+    if (!esDelDominio(q) && !SALUDOS.test(q.trim()) && !isFollowUp(q) && !cortoConContexto && !extractBudget(q)) {
       console.log(`🛡️ Fuera de dominio: "${query.slice(0, 60)}"`);
       trackWeb({ session_id: sessionId || ip, message_type: "fuera_de_dominio",
         query: query.slice(0, 500), bot_message: "redirigido", products_count: 0 });
